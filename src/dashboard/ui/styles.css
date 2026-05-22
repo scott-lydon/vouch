@@ -43,3 +43,16 @@ tr:nth-child(even) td { background: rgba(35, 45, 68, 0.4); }
 .gradient-text { background: linear-gradient(135deg, #818cf8 0%, #34d399 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
 .empty { padding: 60px 20px; text-align: center; }
 .empty-glyph { font-size: 80px; opacity: 0.2; line-height: 1; }
+
+/* Step rows inside permutation cards: collapsed by default, expand on click. */
+.step-list { display: flex; flex-direction: column; gap: 4px; }
+.step-row { padding: 6px 8px; border-radius: 6px; transition: background 0.12s ease; }
+.step-row:hover { background: rgba(99, 102, 241, 0.08); }
+.step-row[open] { background: rgba(99, 102, 241, 0.06); }
+.step-summary::-webkit-details-marker { display: none; }
+.step-summary { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; user-select: none; }
+.step-detail-body { padding: 8px 0 4px 28px; display: flex; flex-direction: column; gap: 4px; }
+.step-detail-row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.step-detail-row code { word-break: break-all; }
+details.step-row > summary > span.text-xs { transition: opacity 0.12s ease; }
+details.step-row[open] > summary > span.text-xs { opacity: 0 !important; }

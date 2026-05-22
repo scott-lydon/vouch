@@ -376,21 +376,57 @@ function renderPermutationCard(p, actions) {
   const oneIndexed = (p.permutation.index ?? 0) + 1;
   const permLabel = `Permutation ${oneIndexed} (${shortId})`;
 
-  const actionsList = el('div', { class: 'space-y-1 mb-3' },
-    (p.action_descriptions ?? []).map((ad, i) =>
-      ad
-        ? el('div', { class: 'text-sm' }, [
-            el('span', { class: 'kbd' }, `step ${i + 1}`),
-            ' ',
-            el('span', { class: 'badge badge-accent', style: 'margin-right:6px;' }, ad.kind),
-            el('span', {}, ad.description),
-            ad.selector ? el('span', { class: 'muted text-xs' }, ` · ${ad.selector}`) : null,
-            ad.type_value !== null && ad.type_value !== undefined
-              ? el('span', { class: 'muted text-xs' }, ` · types: "${ad.type_value}"`)
-              : null,
-          ])
-        : el('div', { class: 'text-sm bad' }, `(unknown action ${i + 1})`)
-    )
+  // Each step is a click-to-expand <details>. Summary stays clean (step N,
+  // kind chip, human description); the technical detail (CSS selector, typed
+  // value, meta) lives in the expanded body. Default collapsed so the card
+  // doesn't drown the eye in nth-of-type selector paths the operator rarely
+  // needs to read for a healthy run.
+  const actionsList = el(
+    'div',
+    { class: 'step-list mb-3' },
+    (p.action_descriptions ?? []).map((ad, i) => {
+      if (!ad) return el('div', { class: 'text-sm bad' }, `(unknown action ${i + 1})`);
+      const hasDetail = !!(ad.selector || (ad.type_value !== null && ad.type_value !== undefined));
+      const summaryChildren = [
+        el('span', { class: 'kbd' }, `step ${i + 1}`),
+        ' ',
+        el('span', { class: 'badge badge-accent', style: 'margin-right:6px;' }, ad.kind),
+        el('span', {}, ad.description),
+        hasDetail
+          ? el('span', { class: 'muted text-xs ml-2', style: 'opacity:0.6;' }, '› expand')
+          : null,
+      ];
+      if (!hasDetail) {
+        return el('div', { class: 'step-row text-sm' }, summaryChildren.slice(0, 3));
+      }
+      const detailRows = [];
+      if (ad.selector) {
+        detailRows.push(
+          el('div', { class: 'step-detail-row' }, [
+            el('span', { class: 'muted text-xs', style: 'min-width: 80px; display: inline-block;' }, 'selector:'),
+            el('code', { class: 'text-xs' }, ad.selector),
+          ]),
+        );
+      }
+      if (ad.type_value !== null && ad.type_value !== undefined) {
+        detailRows.push(
+          el('div', { class: 'step-detail-row' }, [
+            el('span', { class: 'muted text-xs', style: 'min-width: 80px; display: inline-block;' }, 'types:'),
+            el('code', { class: 'text-xs' }, ad.type_value === '' ? '(empty string)' : ad.type_value),
+          ]),
+        );
+      }
+      detailRows.push(
+        el('div', { class: 'step-detail-row muted text-xs' }, [
+          el('span', { style: 'min-width: 80px; display: inline-block;' }, 'action id:'),
+          el('code', {}, ad.id),
+        ]),
+      );
+      return el('details', { class: 'step-row' }, [
+        el('summary', { class: 'step-summary text-sm', style: 'list-style:none; cursor:pointer;' }, summaryChildren),
+        el('div', { class: 'step-detail-body' }, detailRows),
+      ]);
+    }),
   );
 
   const prediction = p.prediction;

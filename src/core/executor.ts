@@ -194,7 +194,37 @@ async function playStep(
   switch (action.kind) {
     case "click": {
       if (!action.selector) throw new Error(`click action ${action.id} has no selector`);
+      // Capture the pre-click URL so we can detect SPA route changes that
+      // Playwright's load/networkidle events don't always fire for.
+      const beforeUrl = page.url();
       await page.locator(action.selector).first().click({ timeout });
+      // Vouch 2026-05-22 bug surfaced on Meridian's deployed frontend: the
+      // executor returned the moment the click was dispatched, before
+      // Next.js client-side routing had updated the URL or rendered the
+      // target page. Subsequent observation snapshots captured the OLD URL
+      // and the expectation verifier reported "navigation never occurred"
+      // for every nav-link click. Fix: after every click, give the page a
+      // short, capped chance to settle. We race three signals so we wait
+      // exactly as long as the click actually needed, never longer:
+      //   1. networkidle — covers SSR full-document navigations
+      //   2. load — covers initial-paint completion for hard navigations
+      //   3. URL change vs. pre-click — covers SPA route changes (Next.js
+      //      <Link>, react-router, etc.) where neither networkidle nor
+      //      load fires because no new document loads
+      // 1500 ms cap because a click that does nothing must not stall a
+      // depth-5 campaign for tens of seconds per permutation.
+      const settleTimeoutMs = 1_500;
+      await Promise.race([
+        page.waitForLoadState("networkidle", { timeout: settleTimeoutMs }).catch(() => {}),
+        page.waitForLoadState("load", { timeout: settleTimeoutMs }).catch(() => {}),
+        page
+          .waitForFunction(
+            (oldUrl) => window.location.href !== oldUrl,
+            beforeUrl,
+            { timeout: settleTimeoutMs, polling: 50 },
+          )
+          .catch(() => {}),
+      ]);
       return;
     }
     case "focus_input": {

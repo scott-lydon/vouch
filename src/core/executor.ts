@@ -211,33 +211,39 @@ async function playStep(
       // Playwright's load/networkidle events don't always fire for.
       const beforeUrl = page.url();
       await page.locator(action.selector).first().click({ timeout });
-      // Vouch 2026-05-22 bug surfaced on Meridian's deployed frontend: the
-      // executor returned the moment the click was dispatched, before
-      // Next.js client-side routing had updated the URL or rendered the
-      // target page. Subsequent observation snapshots captured the OLD URL
-      // and the expectation verifier reported "navigation never occurred"
-      // for every nav-link click. Fix: after every click, give the page a
-      // short, capped chance to settle. We race three signals so we wait
-      // exactly as long as the click actually needed, never longer:
-      //   1. networkidle — covers SSR full-document navigations
-      //   2. load — covers initial-paint completion for hard navigations
-      //   3. URL change vs. pre-click — covers SPA route changes (Next.js
-      //      <Link>, react-router, etc.) where neither networkidle nor
-      //      load fires because no new document loads
-      // 1500 ms cap because a click that does nothing must not stall a
-      // depth-5 campaign for tens of seconds per permutation.
-      const settleTimeoutMs = 1_500;
+      // Two-phase settle.
+      //
+      // PHASE 1 (URL change OR load event, cap 1500 ms): the moment we know
+      // whether the click triggered any navigation. For a click that does
+      // nothing (button that toggles a local state, dropdown, no-op),
+      // neither URL nor load will fire; the 1500 ms cap then expires and we
+      // proceed without stalling the run.
+      //
+      // PHASE 2 (networkidle, cap 3500 ms, ONLY if URL changed): the gap
+      // Vouch's 2026-05-22 depth-2 run against Meridian's deployed frontend
+      // surfaced. SPAs (Next.js <Link>, react-router) flip the URL
+      // synchronously via History.pushState but the new route then fires its
+      // own data fetches (Solana RPC, REST, etc.) that take 2-5 s to settle.
+      // Reading observed_post_state in that window catches loading skeletons
+      // / "Loading on-chain markets..." copy instead of the destination
+      // content the Oracle predicted, which trips the verifier as a false
+      // positive bug candidate. We only pay this second wait when a route
+      // change actually happened — no-op clicks don't compound.
+      const phase1Cap = 1_500;
+      const phase2Cap = 3_500;
       await Promise.race([
-        page.waitForLoadState("networkidle", { timeout: settleTimeoutMs }).catch(() => {}),
-        page.waitForLoadState("load", { timeout: settleTimeoutMs }).catch(() => {}),
+        page.waitForLoadState("load", { timeout: phase1Cap }).catch(() => {}),
         page
           .waitForFunction(
             (oldUrl) => window.location.href !== oldUrl,
             beforeUrl,
-            { timeout: settleTimeoutMs, polling: 50 },
+            { timeout: phase1Cap, polling: 50 },
           )
           .catch(() => {}),
       ]);
+      if (page.url() !== beforeUrl) {
+        await page.waitForLoadState("networkidle", { timeout: phase2Cap }).catch(() => {});
+      }
       return;
     }
     case "focus_input": {

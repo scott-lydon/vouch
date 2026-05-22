@@ -16,7 +16,7 @@
 // Both sources produce a typed `Prediction` row in the same shape. Notes
 // edited by the operator on the dashboard are preserved across re-runs.
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 import Anthropic from "@anthropic-ai/sdk";
 
@@ -38,14 +38,45 @@ export interface OracleResult {
 }
 
 /**
- * The user can override the auto-detected source with --oracle. When omitted,
- * Vouch picks the best available: anthropic-haiku if ANTHROPIC_API_KEY is set,
- * otherwise heuristic. The user has to explicitly opt into claude-cli with
- * --oracle claude-cli because it's slower and counts against their Claude
- * subscription rate limit.
+ * Default-source detection. Priority order (highest first):
+ *
+ *   1. process.env.VOUCH_ORACLE — explicit env override, validated as a known source.
+ *   2. claude-cli — if the `claude` binary is on PATH. Uses the user's local
+ *      Claude subscription (Max-plan token allowance) instead of API billing.
+ *      Default model is Sonnet; the user's global ~/.claude/CLAUDE.md and any
+ *      project CLAUDE.md auto-load. Slower than the API (~5-15s per call) but
+ *      free at the margin if subscription tokens aren't being maxed out.
+ *   3. anthropic-haiku — if ANTHROPIC_API_KEY is set. Cheapest API option;
+ *      ~$0.02 per 51-permutation run.
+ *   4. heuristic — deterministic rule-based fallback. No LLM, no spec
+ *      grounding. Always available.
+ *
+ * The user explicitly chose claude-cli as the default when available because
+ * their subscription token allowance has zero marginal cost. Override with
+ * --oracle on the CLI or VOUCH_ORACLE=anthropic-haiku in the env.
  */
 export function detectOracleSource(): PredictionSource {
-  return process.env.ANTHROPIC_API_KEY ? "anthropic-haiku" : "heuristic";
+  const fromEnv = process.env.VOUCH_ORACLE;
+  if (fromEnv === "anthropic-haiku" || fromEnv === "claude-cli" || fromEnv === "heuristic") {
+    return fromEnv;
+  }
+  if (isClaudeCliAvailable()) return "claude-cli";
+  if (process.env.ANTHROPIC_API_KEY) return "anthropic-haiku";
+  return "heuristic";
+}
+
+/**
+ * Is the `claude` binary on PATH? Used by detectOracleSource(). We do a
+ * synchronous check at module level because the result is stable for the
+ * lifetime of a Vouch process. We do NOT verify auth here — that's deferred
+ * to the actual claude-cli call so a degraded run is one failed permutation,
+ * not a refusal to start.
+ */
+function isClaudeCliAvailable(): boolean {
+  // spawnSync works cleanly in both ESM and CJS; `command -v` exits 0 iff
+  // the named binary is on PATH and executable.
+  const probe = spawnSync("/bin/sh", ["-c", "command -v claude"], { stdio: "ignore" });
+  return probe.status === 0;
 }
 
 /**

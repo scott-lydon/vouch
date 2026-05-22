@@ -63,14 +63,20 @@ program
   .description("Check environment: Node version, Playwright install, Anthropic key, DB writeable.")
   .action(async () => {
     const lines: string[] = [];
+    const source = detectOracleSource();
     lines.push(`node:               ${process.version}`);
     lines.push(`db path:            ${DB_PATH}`);
-    lines.push(`oracle source:      ${detectOracleSource()}`);
-    if (!process.env.ANTHROPIC_API_KEY) {
-      lines.push(`anthropic key:      not set (heuristic oracle will be used; set ANTHROPIC_API_KEY for real predictions)`);
+    lines.push(`oracle source:      ${source}`);
+    if (process.env.VOUCH_ORACLE) {
+      lines.push(`                    (forced by VOUCH_ORACLE=${process.env.VOUCH_ORACLE})`);
+    } else if (source === "claude-cli") {
+      lines.push(`                    (default because the 'claude' CLI is on PATH; uses your Claude subscription, ~5-15s per permutation)`);
+    } else if (source === "anthropic-haiku") {
+      lines.push(`                    (default because ANTHROPIC_API_KEY is set and 'claude' CLI is not on PATH; ~1-2s per permutation, billed per token)`);
     } else {
-      lines.push(`anthropic key:      set (real Haiku predictions enabled)`);
+      lines.push(`                    (no LLM source available; install 'claude' CLI for free predictions via subscription, or set ANTHROPIC_API_KEY for API)`);
     }
+    lines.push(`anthropic key:      ${process.env.ANTHROPIC_API_KEY ? "set" : "not set"}`);
     try {
       const db = openDB(DB_PATH);
       db.raw.close();

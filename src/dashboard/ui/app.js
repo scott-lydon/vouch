@@ -167,6 +167,28 @@ async function viewRun(runId) {
         el('a', { href: `/api/runs/${run.id}/findings?format=markdown`, target: '_blank', class: 'btn btn-primary' }, 'View Findings report (markdown)'),
         el('a', { href: `/api/runs/${run.id}/findings`, target: '_blank', class: 'btn' }, 'Findings as JSON'),
       ]),
+      // Inline help so the badges + labels below aren't cryptic on first read.
+      el('details', { class: 'panel p-5 mb-6' }, [
+        el('summary', { class: 'cursor-pointer font-semibold', style: 'list-style:none;' }, 'What does each column on a permutation card mean? (click to expand)'),
+        el('div', { class: 'mt-4 text-sm muted space-y-2' }, [
+          el('p', {}, el('strong', { class: 'accent-text' }, 'Primary verdict (top-right of each card): '),
+            'one of CRASHED, BUG CANDIDATE, FLAGGED (rules), VERIFIED, or NOT VERIFIED. CRASHED means Playwright threw at some step. BUG CANDIDATE means Playwright ran clean but the page’s observed end-state semantically disagrees with what the AI predicted — a real candidate SUT bug. FLAGGED (rules) means the same disagreement was found by the no-LLM heuristic verifier, which over-flags by design; treat as a hint, not a confirmation. VERIFIED means Playwright passed AND the verifier said the observed state matches the prediction. NOT VERIFIED means we executed but didn’t run the diff pass.'),
+          el('p', {}, el('strong', { class: 'accent-text' }, 'Actions (numbered list): '),
+            'the ordered sequence Vouch replayed in a fresh Playwright context. At depth N each card has N steps. Each step shows its kind (click, focus_input, type, ...) and a human description.'),
+          el('p', {}, el('strong', { class: 'accent-text' }, 'Expected behavior (AI predicted): '),
+            'what the Oracle thinks the user should observe after the final step. Source-tagged: ',
+            el('code', {}, 'Claude/Sonnet'),
+            ', ',
+            el('code', {}, 'Haiku'),
+            ', or ',
+            el('code', {}, 'rule-based'),
+            ' (no LLM, deterministic text composition; over-cautious).'),
+          el('p', {}, el('strong', { class: 'accent-text' }, 'Override expected behavior (operator note): '),
+            'editable textarea. Type your own definition of what the page SHOULD do. Saves on blur, persists across runs. When set, it’s the authoritative expected behavior. The “Copy AI prediction” button fills the textarea with the current Oracle text so you can edit instead of retyping.'),
+          el('p', {}, el('strong', { class: 'accent-text' }, 'Observed: '),
+            'what Playwright actually captured at the end of the sequence: the URL, the page title, and the visible body text. The verifier compares this against the expected behavior above.'),
+        ]),
+      ]),
 
       el('div', { class: 'grid md:grid-cols-5 gap-3 mb-8' }, [
         statCard('Permutations', permutations.length, 'badge-accent'),
@@ -228,19 +250,102 @@ function detailsPanel(title, content) {
   return wrap;
 }
 
+/**
+ * Compute the single primary verdict for a card. Combines Playwright
+ * verdict + verifier verdict + verifier source into one human label.
+ */
+function primaryVerdict(playwrightVerdict, expectation) {
+  if (!playwrightVerdict || playwrightVerdict === 'pending') {
+    return { label: 'NOT EXECUTED', badge: 'badge-warn', explainer: 'Vouch has not replayed this permutation yet.' };
+  }
+  if (playwrightVerdict !== 'pass') {
+    // Crash / timeout / infrastructure error — always primary.
+    return {
+      label: 'CRASHED',
+      badge: 'badge-bad',
+      explainer: `Playwright threw during one of the steps (verdict='${playwrightVerdict}'). The page didn't reach a final state.`,
+    };
+  }
+  if (!expectation) {
+    return {
+      label: 'NOT VERIFIED',
+      badge: 'badge-warn',
+      explainer: 'Playwright ran clean, but the expectation diff pass did not run for this permutation. Run with --verify.',
+    };
+  }
+  if (expectation.match) {
+    return {
+      label: 'VERIFIED',
+      badge: 'badge-good',
+      explainer: `The page's observed state matched the AI's predicted expected behavior (verifier: ${expectation.source}).`,
+    };
+  }
+  // Mismatch. Severity depends on verifier source.
+  if (expectation.source === 'heuristic') {
+    return {
+      label: 'FLAGGED (rules)',
+      badge: 'badge-warn',
+      explainer: 'The no-LLM rule-based verifier saw low text overlap between expected and observed. This verifier over-flags by design — treat as a hint that warrants a closer look, not a confirmed SUT bug. For a real semantic verdict, run with --verify-source claude-cli or anthropic-haiku.',
+    };
+  }
+  return {
+    label: 'BUG CANDIDATE',
+    badge: 'badge-bad',
+    explainer: `The page's observed state semantically diverges from the AI's prediction (verifier: ${expectation.source}). Either the SUT has a bug, or the prediction was wrong. Edit the operator note below to record the right answer.`,
+  };
+}
+
+/**
+ * Parse the Executor's observed_post_state string into structured rows.
+ * Format produced by executor.ts observePostState(): `url=X | title=Y | text="Z"`
+ */
+function parseObserved(observed) {
+  const out = { url: null, title: null, text: null, raw: observed };
+  if (typeof observed !== 'string') return out;
+  const urlMatch = observed.match(/url=([^|]+?)(?:\s*\||$)/);
+  const titleMatch = observed.match(/title=([^|]+?)(?:\s*\||$)/);
+  const textMatch = observed.match(/text=\"([\s\S]*?)\"\s*$/);
+  if (urlMatch) out.url = urlMatch[1].trim();
+  if (titleMatch) out.title = titleMatch[1].trim();
+  if (textMatch) out.text = textMatch[1].trim();
+  return out;
+}
+
+function sourceLabel(src) {
+  if (src === 'anthropic-haiku') return 'Claude Haiku (API)';
+  if (src === 'claude-cli') return 'local Claude CLI';
+  if (src === 'heuristic') return 'rule-based (no LLM)';
+  return src || 'unknown';
+}
+
 function renderPermutationCard(p, actions) {
-  const verdict = p.execution?.verdict ?? 'pending';
-  const cardClass = 'perm-card ' + verdict;
+  const playwrightVerdict = p.execution?.verdict ?? 'pending';
+  const exp = p.expectation;
+  const primary = primaryVerdict(playwrightVerdict, exp);
+
+  // Card border tint based on primary verdict, not just Playwright.
+  let cardClass = 'perm-card ';
+  if (primary.label === 'VERIFIED') cardClass += 'pass';
+  else if (primary.label === 'CRASHED' || primary.label === 'BUG CANDIDATE') cardClass += 'fail';
+  else cardClass += 'pending';
+
+  // 1-indexed friendly permutation name.
+  const shortId = p.permutation.id.includes('__') ? p.permutation.id.split('__').pop() : p.permutation.id;
+  const oneIndexed = (p.permutation.index ?? 0) + 1;
+  const permLabel = `Permutation ${oneIndexed} (${shortId})`;
 
   const actionsList = el('div', { class: 'space-y-1 mb-3' },
     (p.action_descriptions ?? []).map((ad, i) =>
       ad
         ? el('div', { class: 'text-sm' }, [
-            el('span', { class: 'kbd' }, `${i + 1}`),
+            el('span', { class: 'kbd' }, `step ${i + 1}`),
             ' ',
             el('span', { class: 'badge badge-accent', style: 'margin-right:6px;' }, ad.kind),
             el('span', {}, ad.description),
             ad.selector ? el('span', { class: 'muted text-xs' }, ` · ${ad.selector}`) : null,
+            ad.type_value !== null && ad.type_value !== undefined
+              ? el('span', { class: 'muted text-xs' }, ` · types: "${ad.type_value}"`)
+              : null,
           ])
         : el('div', { class: 'text-sm bad' }, `(unknown action ${i + 1})`)
     )
@@ -249,9 +354,9 @@ function renderPermutationCard(p, actions) {
   const prediction = p.prediction;
   const predictionBlock = prediction
     ? el('div', { class: 'panel p-4 mt-3', style: 'background: var(--panel2);' }, [
-        el('div', { class: 'flex items-center gap-2 mb-2' }, [
-          el('span', { class: 'text-sm font-semibold' }, 'AI prediction'),
-          el('span', { class: 'badge ' + (prediction.source === 'heuristic' ? 'badge-warn' : 'badge-good') }, prediction.source),
+        el('div', { class: 'flex items-center gap-2 mb-2 flex-wrap' }, [
+          el('span', { class: 'text-sm font-semibold' }, 'Expected behavior (AI predicted)'),
+          el('span', { class: 'badge ' + (prediction.source === 'heuristic' ? 'badge-warn' : 'badge-good') }, sourceLabel(prediction.source)),
           el('span', { class: 'muted text-xs' }, `confidence ${(prediction.confidence * 100).toFixed(0)}%`),
           prediction.cost_usd > 0
             ? el('span', { class: 'muted text-xs' }, `· $${prediction.cost_usd.toFixed(5)}`)
@@ -265,44 +370,50 @@ function renderPermutationCard(p, actions) {
     ? noteEditor(p.permutation.id, prediction)
     : null;
 
+  // Parsed observed-state for readability.
   const exec = p.execution;
+  const observedParsed = exec ? parseObserved(exec.observed_post_state) : null;
   const execBlock = exec
     ? el('div', { class: 'panel p-4 mt-3', style: 'background: var(--panel2);' }, [
-        el('div', { class: 'flex items-center gap-2 mb-2' }, [
-          el('span', { class: 'text-sm font-semibold' }, 'Observed'),
-          el('span', { class: 'badge ' + verdictBadge(exec.verdict) }, exec.verdict),
+        el('div', { class: 'flex items-center gap-2 mb-3 flex-wrap' }, [
+          el('span', { class: 'text-sm font-semibold' }, 'Observed (what the browser actually showed)'),
+          el('span', { class: 'badge ' + verdictBadge(exec.verdict) }, 'Playwright: ' + exec.verdict),
           el('span', { class: 'muted text-xs' }, `${exec.step_log.length} step${exec.step_log.length === 1 ? '' : 's'} · ${fmtLocal(exec.started_at)}`),
         ]),
-        el('p', { class: 'text-xs muted' }, exec.observed_post_state.slice(0, 400) + (exec.observed_post_state.length > 400 ? '…' : '')),
+        observedParsed && observedParsed.url
+          ? el('div', { class: 'text-xs space-y-1' }, [
+              el('div', {}, [el('span', { class: 'muted' }, 'URL: '), el('code', {}, observedParsed.url)]),
+              observedParsed.title ? el('div', {}, [el('span', { class: 'muted' }, 'Page title: '), el('span', {}, observedParsed.title)]) : null,
+              observedParsed.text ? el('div', {}, [
+                el('span', { class: 'muted' }, 'Visible text: '),
+                el('span', {}, (observedParsed.text.length > 300 ? observedParsed.text.slice(0, 300) + '…' : observedParsed.text)),
+              ]) : null,
+            ])
+          : el('p', { class: 'text-xs muted' }, exec.observed_post_state.slice(0, 400) + (exec.observed_post_state.length > 400 ? '…' : '')),
         exec.error_class ? el('div', { class: 'bad text-xs mt-2' }, `error_class: ${exec.error_class}`) : null,
       ])
     : el('div', { class: 'muted text-xs italic mt-3' }, 'Not executed yet.');
 
   // Expectation verdict: did observed match expected?
-  const exp = p.expectation;
   const expBlock = exp
-    ? el('div', { class: 'panel p-4 mt-3', style: 'background: var(--panel2); border-left: 3px solid ' + (exp.match ? 'var(--good)' : 'var(--bad)') + ';' }, [
-        el('div', { class: 'flex items-center gap-2 mb-2' }, [
-          el('span', { class: 'text-sm font-semibold' }, 'Expectation diff'),
-          el('span', { class: 'badge ' + (exp.match ? 'badge-good' : 'badge-bad') }, exp.match ? 'MATCH' : 'MISMATCH'),
-          el('span', { class: 'badge ' + (exp.source === 'heuristic' ? 'badge-warn' : 'badge-good') }, exp.source),
+    ? el('div', { class: 'panel p-4 mt-3', style: 'background: var(--panel2); border-left: 3px solid ' + (exp.match ? 'var(--good)' : (exp.source === 'heuristic' ? 'var(--warn)' : 'var(--bad)')) + ';' }, [
+        el('div', { class: 'flex items-center gap-2 mb-2 flex-wrap' }, [
+          el('span', { class: 'text-sm font-semibold' }, 'Verifier diff (expected vs observed)'),
+          el('span', { class: 'badge ' + (exp.match ? 'badge-good' : (exp.source === 'heuristic' ? 'badge-warn' : 'badge-bad')) }, exp.match ? 'MATCH' : 'MISMATCH'),
+          el('span', { class: 'badge ' + (exp.source === 'heuristic' ? 'badge-warn' : 'badge-good') }, sourceLabel(exp.source)),
           exp.cost_usd > 0 ? el('span', { class: 'muted text-xs' }, `· $${exp.cost_usd.toFixed(5)}`) : null,
         ]),
-        el('p', { class: 'text-xs ' + (exp.match ? 'muted' : 'bad') }, exp.reasoning),
+        el('p', { class: 'text-xs ' + (exp.match ? 'muted' : (exp.source === 'heuristic' ? 'warn' : 'bad')) }, exp.reasoning),
       ])
     : null;
 
-  // Permutation ids are globally unique (`<run_id>__perm_00042`). Show only
-  // the short suffix in the UI; the full id is in the data and accessible via
-  // DOM inspection if needed.
-  const shortPermId = p.permutation.id.includes('__') ? p.permutation.id.split('__').pop() : p.permutation.id;
   return el('div', { class: cardClass }, [
-    el('div', { class: 'flex items-center justify-between mb-3' }, [
-      el('span', { class: 'font-semibold' }, shortPermId),
-      el('div', { class: 'flex gap-2 items-center' }, [
-        exp ? el('span', { class: 'badge ' + (exp.match ? 'badge-good' : 'badge-bad') }, exp.match ? 'match' : 'mismatch') : null,
-        el('span', { class: 'badge ' + verdictBadge(verdict) }, verdict),
+    el('div', { class: 'flex items-start justify-between gap-3 mb-3 flex-wrap' }, [
+      el('div', {}, [
+        el('div', { class: 'font-semibold text-lg' }, permLabel),
+        el('div', { class: 'muted text-xs mt-1', title: primary.explainer }, primary.explainer),
       ]),
+      el('span', { class: 'badge ' + primary.badge, style: 'font-size: 0.85rem; padding: 6px 14px;' }, primary.label),
     ]),
     actionsList,
     predictionBlock,
@@ -313,13 +424,24 @@ function renderPermutationCard(p, actions) {
 }
 
 function noteEditor(permId, prediction) {
-  const ta = el('textarea', { class: 'note-textarea', placeholder: 'Edit the expected behavior. Saved automatically when you click away.' });
+  const ta = el('textarea', {
+    class: 'note-textarea',
+    placeholder: 'Type your own definition of what should happen. Saves automatically when you click away. Leave blank to use the AI prediction above.',
+  });
   ta.value = prediction.user_note_text ?? '';
-  const status = el('div', { class: 'muted text-xs mt-1' }, prediction.user_note_edited_at ? `Note saved ${fmtRelative(prediction.user_note_edited_at)}` : 'No note yet.');
-  ta.addEventListener('blur', async () => {
+  const status = el(
+    'div',
+    { class: 'muted text-xs mt-1' },
+    prediction.user_note_edited_at
+      ? `Note saved ${fmtRelative(prediction.user_note_edited_at)}.`
+      : 'No override set yet. The AI prediction above is currently authoritative for the verifier.',
+  );
+
+  const save = async () => {
     const v = ta.value.trim();
     if (v === (prediction.user_note_text ?? '').trim()) return; // no-op
     status.textContent = 'Saving…';
+    status.className = 'muted text-xs mt-1';
     try {
       const { prediction: updated } = await api(`/api/predictions/${permId}/note`, {
         method: 'POST',
@@ -327,15 +449,35 @@ function noteEditor(permId, prediction) {
       });
       prediction.user_note_text = updated.user_note_text;
       prediction.user_note_edited_at = updated.user_note_edited_at;
-      status.textContent = `Note saved ${fmtRelative(updated.user_note_edited_at)}`;
+      status.textContent = `Note saved ${fmtRelative(updated.user_note_edited_at)}. This is now authoritative.`;
       status.className = 'good text-xs mt-1';
     } catch (err) {
       status.textContent = `Save failed: ${err.message}`;
       status.className = 'bad text-xs mt-1';
     }
-  });
+  };
+  ta.addEventListener('blur', save);
+
+  const copyBtn = el(
+    'button',
+    {
+      class: 'btn',
+      style: 'font-size: 0.75rem; padding: 4px 10px;',
+      onClick: () => {
+        ta.value = prediction.expected_post_state;
+        ta.focus();
+        status.textContent = 'Copied AI prediction into textarea. Edit if needed, then click away to save.';
+        status.className = 'accent-text text-xs mt-1';
+      },
+    },
+    'Copy AI prediction into my note',
+  );
+
   return el('div', { class: 'mt-3' }, [
-    el('div', { class: 'text-xs muted mb-1' }, 'Your override (operator note, persisted across runs):'),
+    el('div', { class: 'flex items-center justify-between gap-3 mb-1 flex-wrap' }, [
+      el('div', { class: 'text-xs muted' }, 'Override expected behavior (your authoritative version; the verifier uses this when set):'),
+      copyBtn,
+    ]),
     ta,
     status,
   ]);

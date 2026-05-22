@@ -15,6 +15,8 @@
 //
 // Stable selector preference: data-testid > [name] > ARIA role+name > nth-of-type CSS path.
 
+import { createHash } from "node:crypto";
+
 import { chromium, type Browser, type Page } from "playwright";
 
 import { type Action, type ActionKind } from "./types.js";
@@ -177,7 +179,21 @@ function actionIdFromSelector(kind: ActionKind, selector: string | null, salt = 
     .replace(/[^a-zA-Z0-9_-]+/g, "_")
     .replace(/^_+|_+$/g, "")
     .slice(0, 60);
-  return `${kind}__${safe}${salt ? `__${salt}` : ""}`;
+  // A 60-char prefix is fine for sample-form fixtures where every selector is
+  // short and unique. On real React / Next.js apps (e.g. Meridian) many
+  // deeply-nested element selectors share long auto-generated class prefixes
+  // so the sliced `safe` collides across DISTINCT cssPaths — but the dedupe
+  // key in synthesizeActions uses the full cssPath, so both survive synthesis
+  // and the duplicate-id row trips the SQLite PRIMARY KEY(run_id, id)
+  // UNIQUE constraint when the run is persisted. Append a short deterministic
+  // hash of the FULL (pre-slice, pre-sanitize) selector + salt so the id stays
+  // human-readable AND globally unique within a run. Hash is sha256[..8] so a
+  // collision is ~1 in 2^32 — fine for selector uniqueness, not security.
+  const fingerprint = createHash("sha256")
+    .update(`${kind}::${base}::${salt}`)
+    .digest("hex")
+    .slice(0, 8);
+  return `${kind}__${safe}${salt ? `__${salt}` : ""}__${fingerprint}`;
 }
 
 interface TypeVariant {

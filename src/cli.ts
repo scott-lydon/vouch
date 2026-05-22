@@ -36,6 +36,8 @@ import { generatePermutationsWithStats } from "./core/permutations.js";
 import { mapSurface } from "./core/surface.js";
 import {
   finalizeRun,
+  getExecution,
+  getExpectationVerdict,
   getPrediction,
   getProject,
   getProjectByName,
@@ -49,6 +51,7 @@ import {
   listActiveBlockedPrefixes,
   listAllBlockedPrefixes,
   listPermutationsForRun,
+  listRunsForProject,
   openDB,
   unblockAllPrefixes,
   unblockPrefixById,
@@ -212,33 +215,123 @@ async function runOneDepth(input: RunOneDepthInputs): Promise<string> {
       `\n`,
   );
 
-  process.stdout.write(`[depth ${depth}] running oracle (source=${oracleSource})...\n`);
   const actionsById = new Map(actions.map((a) => [a.id, a]));
-  let oracleCost = 0;
-  // For the claude-cli source the per-call subprocess spawn dominates the
-  // wallclock (~3-5s out of ~10s per perm), so batching N perms into one
-  // call gives ~Nx speedup on the oracle phase. anthropic-haiku already
-  // pays only ~1s per HTTP round-trip and has no batch endpoint at this
-  // size, so we keep the per-perm loop for it. heuristic is in-process
-  // and instant — no point batching either.
-  if (oracleSource === "claude-cli") {
-    const BATCH_SIZE = 30;
-    const allInputs = perms.map((perm) => ({
-      permutation: perm,
-      actionsById,
-      specText: project.spec_text,
-      projectName: project.name,
-      projectDescription: project.description,
-      targetUrl,
-    }));
-    for (let i = 0; i < allInputs.length; i += BATCH_SIZE) {
-      const batch = allInputs.slice(i, i + BATCH_SIZE);
-      const batchStart = Date.now();
-      const results = await predictManyClaudeCliOrFallback(batch);
-      const elapsedSec = Math.round((Date.now() - batchStart) / 1000);
-      for (let j = 0; j < results.length; j++) {
-        const res = results[j]!;
-        const perm = batch[j]!.permutation;
+  await runMissingPhases({
+    db,
+    project,
+    actions,
+    actionsById,
+    perms,
+    targetUrl,
+    depth,
+    runId,
+    oracleSource,
+    verify,
+    verifySource,
+    screenshots: input.screenshots,
+    logPrefix: `[depth ${depth}]`,
+  });
+  return runId;
+}
+
+// ============================================================================
+// Shared phase runner — used by `vouch run`, `vouch campaign`, and `vouch resume`.
+// Each phase only runs on permutations that don't already have a corresponding
+// row in the DB. This makes the entire pipeline idempotent and resumable:
+//   - First execution writes everything.
+//   - Re-execution on the same run is a no-op (all phases skip).
+//   - Re-execution after a partial run completes only the missing work.
+// ============================================================================
+
+interface RunMissingPhasesInputs {
+  db: ReturnType<typeof openDB>;
+  project: NonNullable<ReturnType<typeof getProjectByName>>;
+  actions: Awaited<ReturnType<typeof listActionsForRun>>;
+  actionsById: Map<string, NonNullable<ReturnType<typeof listActionsForRun>>[number]>;
+  perms: Awaited<ReturnType<typeof listPermutationsForRun>>;
+  targetUrl: string;
+  depth: number;
+  runId: string;
+  oracleSource: PredictionSource;
+  verify: boolean;
+  verifySource: PredictionSource;
+  screenshots: boolean;
+  logPrefix: string;
+}
+
+async function runMissingPhases(input: RunMissingPhasesInputs): Promise<void> {
+  const {
+    db,
+    project,
+    actions,
+    actionsById,
+    perms,
+    targetUrl,
+    depth,
+    runId,
+    oracleSource,
+    verify,
+    verifySource,
+    logPrefix,
+  } = input;
+  void actions; // currently unused here; kept on the interface for future phase additions
+
+  // ---- Oracle phase: skip perms that already have a prediction. ----
+  const oraclePending = perms.filter((p) => !getPrediction(db, p.id));
+  if (oraclePending.length === 0) {
+    process.stdout.write(`${logPrefix} oracle: 0 missing predictions, skipping (all ${perms.length} already on disk).\n`);
+  } else {
+    process.stdout.write(
+      `${logPrefix} running oracle (source=${oracleSource}) on ${oraclePending.length} of ${perms.length} perms` +
+        (oraclePending.length < perms.length ? ` (${perms.length - oraclePending.length} already have predictions)` : "") +
+        "\n",
+    );
+    let oracleCost = 0;
+    if (oracleSource === "claude-cli") {
+      const BATCH_SIZE = 30;
+      const allInputs = oraclePending.map((perm) => ({
+        permutation: perm,
+        actionsById,
+        specText: project.spec_text,
+        projectName: project.name,
+        projectDescription: project.description,
+        targetUrl,
+      }));
+      for (let i = 0; i < allInputs.length; i += BATCH_SIZE) {
+        const batch = allInputs.slice(i, i + BATCH_SIZE);
+        const batchStart = Date.now();
+        const results = await predictManyClaudeCliOrFallback(batch);
+        const elapsedSec = Math.round((Date.now() - batchStart) / 1000);
+        for (let j = 0; j < results.length; j++) {
+          const res = results[j]!;
+          const perm = batch[j]!.permutation;
+          oracleCost += res.cost_usd;
+          const existing = getPrediction(db, perm.id);
+          upsertPrediction(
+            db,
+            asPrediction(perm.id, res, {
+              text: existing?.user_note_text ?? null,
+              editedAt: existing?.user_note_edited_at ?? null,
+            }),
+          );
+        }
+        process.stdout.write(
+          `${logPrefix} oracle batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(allInputs.length / BATCH_SIZE)} done (${batch.length} perms in ${elapsedSec}s)\n`,
+        );
+      }
+    } else {
+      for (const perm of oraclePending) {
+        const res = await predictOne(
+          {
+            permutation: perm,
+            actionsById,
+            specText: project.spec_text,
+            projectName: project.name,
+            projectDescription: project.description,
+            targetUrl,
+          },
+          oracleSource,
+        );
         oracleCost += res.cost_usd;
         const existing = getPrediction(db, perm.id);
         upsertPrediction(
@@ -249,76 +342,64 @@ async function runOneDepth(input: RunOneDepthInputs): Promise<string> {
           }),
         );
       }
-      process.stdout.write(
-        `[depth ${depth}] oracle batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(allInputs.length / BATCH_SIZE)} done (${batch.length} perms in ${elapsedSec}s)\n`,
-      );
     }
-  } else {
-    for (const perm of perms) {
-      const res = await predictOne(
-        {
-          permutation: perm,
-          actionsById,
-          specText: project.spec_text,
-          projectName: project.name,
-          projectDescription: project.description,
-          targetUrl,
-        },
-        oracleSource,
-      );
-      oracleCost += res.cost_usd;
-      const existing = getPrediction(db, perm.id);
-      upsertPrediction(
-        db,
-        asPrediction(perm.id, res, {
-          text: existing?.user_note_text ?? null,
-          editedAt: existing?.user_note_edited_at ?? null,
-        }),
-      );
-    }
+    process.stdout.write(`${logPrefix} oracle done (cost ~$${oracleCost.toFixed(4)})\n`);
   }
-  process.stdout.write(`[depth ${depth}] oracle done (cost ~$${oracleCost.toFixed(4)})\n`);
 
-  process.stdout.write(`[depth ${depth}] executing permutations...\n`);
-  const screenshotsDir = input.screenshots ? resolve(process.cwd(), "runs", runId, "screenshots") : null;
-  const execs = await executePermutations(perms, actionsById, {
-    targetUrl,
-    screenshotsDir,
-  });
-  for (const e of execs) upsertExecution(db, e);
-  const counts = execs.reduce<Record<string, number>>((acc, e) => {
-    acc[e.verdict] = (acc[e.verdict] ?? 0) + 1;
-    return acc;
-  }, {});
-  process.stdout.write(`[depth ${depth}] executor verdicts=${JSON.stringify(counts)}\n`);
+  // ---- Executor phase: skip perms that already have an execution row. ----
+  const executorPending = perms.filter((p) => !getExecution(db, p.id));
+  if (executorPending.length === 0) {
+    process.stdout.write(`${logPrefix} executor: 0 missing executions, skipping.\n`);
+  } else {
+    process.stdout.write(
+      `${logPrefix} executing ${executorPending.length} of ${perms.length} permutations` +
+        (executorPending.length < perms.length ? ` (${perms.length - executorPending.length} already executed)` : "") +
+        "\n",
+    );
+    const screenshotsDir = input.screenshots ? resolve(process.cwd(), "runs", runId, "screenshots") : null;
+    const execs = await executePermutations(executorPending, actionsById, {
+      targetUrl,
+      screenshotsDir,
+    });
+    for (const e of execs) upsertExecution(db, e);
+    const counts = execs.reduce<Record<string, number>>((acc, e) => {
+      acc[e.verdict] = (acc[e.verdict] ?? 0) + 1;
+      return acc;
+    }, {});
+    process.stdout.write(`${logPrefix} executor verdicts=${JSON.stringify(counts)}\n`);
+  }
 
   if (verify) {
-    process.stdout.write(`[depth ${depth}] verifying expectations (source=${verifySource})...\n`);
+    process.stdout.write(`${logPrefix} verifying expectations (source=${verifySource})...\n`);
     let verifyCost = 0;
-    // Build the verify inputs once so the batched + per-perm paths share the
-    // same construction. Skip executions whose perm has no prediction (the
-    // oracle phase may have failed for that perm); without a prediction the
-    // verifier has nothing to compare against.
+    // Build verify jobs only for perms that have BOTH a prediction AND an
+    // execution but DON'T yet have a verdict. This is the only correct
+    // intersection: without a prediction there's nothing to verify against;
+    // without an execution there's nothing observed to compare; and if a
+    // verdict already exists, the perm is fully done.
     type VerifyJob = {
       input: import("./core/expectation.js").VerifyInputs;
-      execution: typeof execs[number];
     };
     const jobs: VerifyJob[] = [];
-    for (const e of execs) {
-      const prediction = getPrediction(db, e.permutation_id);
+    for (const perm of perms) {
+      if (getExpectationVerdict(db, perm.id)) continue;
+      const prediction = getPrediction(db, perm.id);
       if (!prediction) continue;
+      const execution = getExecution(db, perm.id);
+      if (!execution) continue;
       jobs.push({
         input: {
-          permutationId: e.permutation_id,
+          permutationId: perm.id,
           expectedPostState: prediction.expected_post_state,
-          observedPostState: e.observed_post_state,
+          observedPostState: execution.observed_post_state,
           projectName: project.name,
           targetUrl,
         },
-        execution: e,
       });
     }
-    if (verifySource === "claude-cli" && jobs.length > 1) {
+    if (jobs.length === 0) {
+      process.stdout.write(`${logPrefix} verify: 0 missing verdicts, skipping.\n`);
+    } else if (verifySource === "claude-cli" && jobs.length > 1) {
       // Same batch sizing as the oracle (30). Same rationale: spec-text is
       // constant across perms in a batch and dominates input size; output
       // is shorter than the oracle (a verdict + 1 sentence vs a paragraph),
@@ -335,7 +416,7 @@ async function runOneDepth(input: RunOneDepthInputs): Promise<string> {
           upsertExpectationVerdict(db, v);
         }
         process.stdout.write(
-          `[depth ${depth}] verify batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(jobs.length / BATCH_SIZE)} done (${batchJobs.length} perms in ${elapsedSec}s)\n`,
+          `${logPrefix} verify batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(jobs.length / BATCH_SIZE)} done (${batchJobs.length} perms in ${elapsedSec}s)\n`,
         );
       }
     } else {
@@ -345,8 +426,9 @@ async function runOneDepth(input: RunOneDepthInputs): Promise<string> {
         upsertExpectationVerdict(db, v);
       }
     }
-    process.stdout.write(`[depth ${depth}] verify done (cost ~$${verifyCost.toFixed(4)})\n`);
+    process.stdout.write(`${logPrefix} verify done (cost ~$${verifyCost.toFixed(4)})\n`);
   }
+
   finalizeRun(db, runId, nowIso());
 
   // Screenshot cleanup: delete dirs for permutations that produced zero
@@ -354,9 +436,8 @@ async function runOneDepth(input: RunOneDepthInputs): Promise<string> {
   // ones that matter.
   if (input.screenshots) {
     const deleted = cleanCleanRunScreenshots(db, runId);
-    process.stdout.write(`[depth ${depth}] screenshots: kept evidence on findings, deleted ${deleted} clean perm dirs\n`);
+    process.stdout.write(`${logPrefix} screenshots: kept evidence on findings, deleted ${deleted} clean perm dirs\n`);
   }
-  return runId;
 }
 
 // ----- run (umbrella) -----
@@ -497,6 +578,37 @@ program
           `  pause         ${opts.pause}\n\n`,
       );
 
+      // Detect unfinished runs for this project and surface them. Don't
+      // auto-resume — the operator should decide explicitly, because resume
+      // and fresh-start aren't always interchangeable (a fresh start may be
+      // what's needed if the SUT changed since the hung run started).
+      const allRunsForProject = listRunsForProject(db, project.id);
+      const unfinished = allRunsForProject.filter((r) => !r.finished_at);
+      if (unfinished.length > 0) {
+        process.stdout.write(
+          `! Notice: ${unfinished.length} unfinished run${unfinished.length === 1 ? "" : "s"} for project '${project.name}':\n`,
+        );
+        for (const r of unfinished.slice(0, 5)) {
+          let havePred = 0,
+            haveExec = 0,
+            haveVerdict = 0;
+          const partPerms = listPermutationsForRun(db, r.id);
+          for (const p of partPerms) {
+            if (getPrediction(db, p.id)) havePred++;
+            if (getExecution(db, p.id)) haveExec++;
+            if (getExpectationVerdict(db, p.id)) haveVerdict++;
+          }
+          process.stdout.write(
+            `  - ${r.id}  depth=${r.depth}  perms=${partPerms.length}  predictions=${havePred}  executions=${haveExec}  verdicts=${haveVerdict}\n`,
+          );
+        }
+        process.stdout.write(
+          `\n  To resume one instead of starting fresh:  vouch resume --run <id>\n` +
+            `  Continuing with a fresh campaign in 3s. Press Ctrl-C to stop.\n\n`,
+        );
+        await new Promise((r) => setTimeout(r, 3_000));
+      }
+
       try {
         for (let depth = 1; depth <= maxDepth; depth++) {
           let advance = false;
@@ -603,6 +715,119 @@ program
       } finally {
         rl?.close();
       }
+    },
+  );
+
+// ----- resume (pick up an unfinished run from where it died) -----
+program
+  .command("resume")
+  .description(
+    "Resume an unfinished run. Loads existing actions + permutations from the DB, " +
+      "then runs only the phases that don't have results yet (oracle / executor / verifier). " +
+      "Safe to invoke repeatedly; each phase no-ops when there's nothing left to do.",
+  )
+  .requiredOption("--run <id>", "Run id to resume (see `vouch serve` or inspect runs/ folder)")
+  .option(
+    "--oracle <source>",
+    "Override the run's stored oracle source. Default: keep the source the run was started with.",
+  )
+  .option(
+    "--verify-source <source>",
+    "Verifier source for the diff pass. Default: same as the oracle source.",
+  )
+  .option("--no-verify", "Skip the expectation-diff pass.")
+  .option("--no-screenshots", "Skip per-step PNG capture (already-captured screenshots are unaffected).")
+  .action(
+    async (opts: {
+      run: string;
+      oracle?: string;
+      verifySource?: string;
+      verify: boolean;
+      screenshots: boolean;
+    }) => {
+      const db = openDB(DB_PATH);
+      const run = getRun(db, opts.run);
+      if (!run) {
+        throw new Error(`Run '${opts.run}' not found in vouch.db. List runs with \`vouch serve\` and visit the dashboard.`);
+      }
+      if (run.finished_at) {
+        throw new Error(
+          `Run '${opts.run}' is already finalized (finished_at=${run.finished_at}). ` +
+            `Resume is for runs that died mid-pipeline (finished_at IS NULL). ` +
+            `To rerun this project from scratch, use \`vouch run\` or \`vouch campaign\`.`,
+        );
+      }
+      const project = getProject(db, run.project_id);
+      if (!project) {
+        throw new Error(`Run '${opts.run}' references project '${run.project_id}' which no longer exists.`);
+      }
+      const actions = listActionsForRun(db, run.id);
+      if (actions.length === 0) {
+        throw new Error(
+          `Run '${opts.run}' has zero actions — it died before the surface mapper completed. ` +
+            `Nothing to resume. Start a fresh run instead: vouch run --project ${project.name} --target ${run.target_url} --depth ${run.depth}.`,
+        );
+      }
+      const perms = listPermutationsForRun(db, run.id);
+      if (perms.length === 0) {
+        throw new Error(
+          `Run '${opts.run}' has zero permutations — it died before the planner completed. ` +
+            `Nothing to resume. Start a fresh run instead: vouch run --project ${project.name} --target ${run.target_url} --depth ${run.depth}.`,
+        );
+      }
+      const validSources = ["anthropic-haiku", "claude-cli", "heuristic"] as const;
+      type V = (typeof validSources)[number];
+      const oracleSource: V = (opts.oracle as V) || (run.prediction_source as V);
+      if (!validSources.includes(oracleSource)) {
+        throw new Error(`Invalid oracle source '${oracleSource}'. Valid: ${validSources.join(", ")}`);
+      }
+      const verifySource: V = (opts.verifySource as V) || oracleSource;
+      if (!validSources.includes(verifySource)) {
+        throw new Error(`Invalid verify source '${verifySource}'. Valid: ${validSources.join(", ")}`);
+      }
+
+      // Report what's already done so the operator sees the resume is taking
+      // advantage of the partial state, not silently restarting.
+      let havePred = 0,
+        haveExec = 0,
+        haveVerdict = 0;
+      for (const p of perms) {
+        if (getPrediction(db, p.id)) havePred++;
+        if (getExecution(db, p.id)) haveExec++;
+        if (getExpectationVerdict(db, p.id)) haveVerdict++;
+      }
+      process.stdout.write(
+        `=== Resuming run ${run.id} ===\n` +
+          `  project        ${project.name}\n` +
+          `  target         ${run.target_url}\n` +
+          `  depth          ${run.depth}\n` +
+          `  oracle         ${oracleSource}\n` +
+          `  verify         ${opts.verify ? verifySource : "disabled"}\n\n` +
+          `  Already on disk for this run:\n` +
+          `    actions       ${actions.length}\n` +
+          `    permutations  ${perms.length}\n` +
+          `    predictions   ${havePred} / ${perms.length}\n` +
+          `    executions    ${haveExec} / ${perms.length}\n` +
+          `    verdicts      ${haveVerdict} / ${perms.length}\n\n`,
+      );
+
+      const actionsById = new Map(actions.map((a) => [a.id, a]));
+      await runMissingPhases({
+        db,
+        project,
+        actions,
+        actionsById,
+        perms,
+        targetUrl: run.target_url,
+        depth: run.depth,
+        runId: run.id,
+        oracleSource,
+        verify: opts.verify !== false,
+        verifySource,
+        screenshots: opts.screenshots !== false,
+        logPrefix: `[resume ${run.id.split("_").pop()}]`,
+      });
+      process.stdout.write(`\n=== Resume complete ===\n  view at: http://localhost:7321/#/run/${run.id}\n`);
     },
   );
 

@@ -180,18 +180,81 @@ function actionIdFromSelector(kind: ActionKind, selector: string | null, salt = 
   return `${kind}__${safe}${salt ? `__${salt}` : ""}`;
 }
 
-function deterministicTypeValue(node: RawNode): string {
-  // Pick a sensible literal based on the field's semantic hint. Deterministic
-  // so re-runs produce identical permutations.
+interface TypeVariant {
+  /** Short identifier appended to the action id (e.g. `valid`, `empty`, `negative`). */
+  key: string;
+  /** Literal text Vouch will type. */
+  value: string;
+  /** One-line human description shown on the dashboard. */
+  description: string;
+}
+
+/**
+ * Returns the plausible test values for a text-like field. Each variant becomes
+ * its own action so permutations can exercise the field with multiple inputs
+ * within a single run. Variants are deterministic so re-runs are reproducible.
+ *
+ * Variant counts per field type (tunable; growth is geometric in depth):
+ *   email:    4 (valid, empty, no_at, no_domain)
+ *   password: 4 (valid, empty, too_short, very_long)
+ *   number:   3 (positive, zero, negative)  — user-requested
+ *   url:      3 (valid, empty, not_url)
+ *   tel:      3 (valid, empty, letters)
+ *   search:   2 (valid, empty)
+ *   text:     2 (valid, empty)
+ */
+function plausibleValuesFor(node: RawNode): TypeVariant[] {
   const t = (node.type ?? "text").toLowerCase();
   const hint = (node.placeholder ?? node.nameAttr ?? node.idAttr ?? "").toLowerCase();
-  if (t === "email" || hint.includes("email")) return "vouch+probe@example.com";
-  if (t === "password" || hint.includes("password")) return "VouchProbe!2026";
-  if (t === "number" || hint.includes("age") || hint.includes("count")) return "42";
-  if (t === "url" || hint.includes("url") || hint.includes("link")) return "https://example.com";
-  if (t === "tel" || hint.includes("phone") || hint.includes("tel")) return "5551234567";
-  if (t === "search" || hint.includes("search")) return "vouch probe";
-  return "vouch probe text";
+
+  if (t === "email" || hint.includes("email")) {
+    return [
+      { key: "valid", value: "vouch+probe@example.com", description: "well-formed email" },
+      { key: "empty", value: "", description: "empty string (tests required-field validation)" },
+      { key: "no_at", value: "not-an-email.com", description: "missing '@' (invalid format)" },
+      { key: "no_domain", value: "bad@", description: "missing domain after '@' (invalid format)" },
+    ];
+  }
+  if (t === "password" || hint.includes("password")) {
+    return [
+      { key: "valid", value: "VouchProbe!2026", description: "meets typical minlength + complexity" },
+      { key: "empty", value: "", description: "empty string (tests required-field validation)" },
+      { key: "too_short", value: "abc", description: "below typical 8-char minimum" },
+      { key: "very_long", value: "x".repeat(200), description: "200 chars (tests maxlength + perf)" },
+    ];
+  }
+  if (t === "number" || hint.includes("age") || hint.includes("count") || hint.includes("number")) {
+    return [
+      { key: "positive", value: "42", description: "positive integer" },
+      { key: "zero", value: "0", description: "zero (boundary)" },
+      { key: "negative", value: "-5", description: "negative integer (some forms reject)" },
+    ];
+  }
+  if (t === "url" || hint.includes("url") || hint.includes("link")) {
+    return [
+      { key: "valid", value: "https://example.com", description: "well-formed URL" },
+      { key: "empty", value: "", description: "empty string" },
+      { key: "not_url", value: "just some text", description: "not a URL (tests format validation)" },
+    ];
+  }
+  if (t === "tel" || hint.includes("phone") || hint.includes("tel")) {
+    return [
+      { key: "valid", value: "5551234567", description: "10-digit phone number" },
+      { key: "empty", value: "", description: "empty string" },
+      { key: "letters", value: "abcdefghij", description: "letters in a tel field (often rejected)" },
+    ];
+  }
+  if (t === "search" || hint.includes("search")) {
+    return [
+      { key: "valid", value: "vouch probe", description: "normal search text" },
+      { key: "empty", value: "", description: "empty search" },
+    ];
+  }
+  // Default text / textarea.
+  return [
+    { key: "valid", value: "vouch probe text", description: "normal text input" },
+    { key: "empty", value: "", description: "empty string" },
+  ];
 }
 
 function synthesizeActions(rawNodes: RawNode[]): Action[] {
@@ -206,14 +269,19 @@ function synthesizeActions(rawNodes: RawNode[]): Action[] {
     const description = describe(node);
 
     if (
-      node.tag === "input" &&
-      ["text", "email", "password", "search", "url", "tel", "number"].includes(
-        (node.type ?? "text").toLowerCase(),
-      )
+      (node.tag === "input" &&
+        ["text", "email", "password", "search", "url", "tel", "number"].includes(
+          (node.type ?? "text").toLowerCase(),
+        )) ||
+      node.tag === "textarea"
     ) {
-      // Emit BOTH focus_input AND type, with the type action carrying a rule.
+      // ONE focus_input per field. MULTIPLE type actions, one per plausible
+      // value — each variant is its own action with a value-key suffix on its
+      // id (e.g. `type__email_input__valid`, `type__email_input__empty`).
+      // The permutation generator treats each variant as a distinct action,
+      // so depth-2 runs exercise the field with several inputs paired against
+      // every other action.
       const focusId = actionIdFromSelector("focus_input", node.cssPath);
-      const typeId = actionIdFromSelector("type", node.cssPath);
       out.push({
         id: focusId,
         kind: "focus_input",
@@ -228,57 +296,31 @@ function synthesizeActions(rawNodes: RawNode[]): Action[] {
           name: node.nameAttr,
         },
       });
-      out.push({
-        id: typeId,
-        kind: "type",
-        selector: node.cssPath,
-        description: `Type into ${description}`,
-        type_value: deterministicTypeValue(node),
-        rules: [
-          {
-            kind: "requires_prior_action",
-            prior_kind: "focus_input",
-            same_selector: true,
-            description: `Requires a prior focus_input on '${node.cssPath}' in the sequence.`,
+      const variants = plausibleValuesFor(node);
+      for (const v of variants) {
+        out.push({
+          id: actionIdFromSelector("type", node.cssPath, v.key),
+          kind: "type",
+          selector: node.cssPath,
+          description: `Type ${v.description} into ${description}`,
+          type_value: v.value,
+          rules: [
+            {
+              kind: "requires_prior_action",
+              prior_kind: "focus_input",
+              same_selector: true,
+              description: `Requires a prior focus_input on '${node.cssPath}' in the sequence.`,
+            },
+          ],
+          meta: {
+            tag: node.tag,
+            type: node.type ?? "text",
+            name: node.nameAttr,
+            variant_key: v.key,
+            variant_description: v.description,
           },
-        ],
-        meta: {
-          tag: node.tag,
-          type: node.type ?? "text",
-          name: node.nameAttr,
-        },
-      });
-      continue;
-    }
-
-    if (node.tag === "textarea") {
-      const focusId = actionIdFromSelector("focus_input", node.cssPath);
-      const typeId = actionIdFromSelector("type", node.cssPath);
-      out.push({
-        id: focusId,
-        kind: "focus_input",
-        selector: node.cssPath,
-        description: `Focus ${description}`,
-        type_value: null,
-        rules: [],
-        meta: { tag: node.tag, name: node.nameAttr },
-      });
-      out.push({
-        id: typeId,
-        kind: "type",
-        selector: node.cssPath,
-        description: `Type into ${description}`,
-        type_value: "Vouch was here.",
-        rules: [
-          {
-            kind: "requires_prior_action",
-            prior_kind: "focus_input",
-            same_selector: true,
-            description: `Requires a prior focus_input on '${node.cssPath}' in the sequence.`,
-          },
-        ],
-        meta: { tag: node.tag, name: node.nameAttr },
-      });
+        });
+      }
       continue;
     }
 

@@ -163,6 +163,10 @@ async function viewRun(runId) {
         `${permutations.length} permutations at depth ${run.depth}, target: `,
         el('code', {}, run.target_url),
       ]),
+      el('div', { class: 'flex gap-3 mb-6' }, [
+        el('a', { href: `/api/runs/${run.id}/findings?format=markdown`, target: '_blank', class: 'btn btn-primary' }, 'View Findings report (markdown)'),
+        el('a', { href: `/api/runs/${run.id}/findings`, target: '_blank', class: 'btn' }, 'Findings as JSON'),
+      ]),
 
       el('div', { class: 'grid md:grid-cols-5 gap-3 mb-8' }, [
         statCard('Permutations', permutations.length, 'badge-accent'),
@@ -274,6 +278,20 @@ function renderPermutationCard(p, actions) {
       ])
     : el('div', { class: 'muted text-xs italic mt-3' }, 'Not executed yet.');
 
+  // Expectation verdict: did observed match expected?
+  const exp = p.expectation;
+  const expBlock = exp
+    ? el('div', { class: 'panel p-4 mt-3', style: 'background: var(--panel2); border-left: 3px solid ' + (exp.match ? 'var(--good)' : 'var(--bad)') + ';' }, [
+        el('div', { class: 'flex items-center gap-2 mb-2' }, [
+          el('span', { class: 'text-sm font-semibold' }, 'Expectation diff'),
+          el('span', { class: 'badge ' + (exp.match ? 'badge-good' : 'badge-bad') }, exp.match ? 'MATCH' : 'MISMATCH'),
+          el('span', { class: 'badge ' + (exp.source === 'heuristic' ? 'badge-warn' : 'badge-good') }, exp.source),
+          exp.cost_usd > 0 ? el('span', { class: 'muted text-xs' }, `· $${exp.cost_usd.toFixed(5)}`) : null,
+        ]),
+        el('p', { class: 'text-xs ' + (exp.match ? 'muted' : 'bad') }, exp.reasoning),
+      ])
+    : null;
+
   // Permutation ids are globally unique (`<run_id>__perm_00042`). Show only
   // the short suffix in the UI; the full id is in the data and accessible via
   // DOM inspection if needed.
@@ -281,12 +299,16 @@ function renderPermutationCard(p, actions) {
   return el('div', { class: cardClass }, [
     el('div', { class: 'flex items-center justify-between mb-3' }, [
       el('span', { class: 'font-semibold' }, shortPermId),
-      el('span', { class: 'badge ' + verdictBadge(verdict) }, verdict),
+      el('div', { class: 'flex gap-2 items-center' }, [
+        exp ? el('span', { class: 'badge ' + (exp.match ? 'badge-good' : 'badge-bad') }, exp.match ? 'match' : 'mismatch') : null,
+        el('span', { class: 'badge ' + verdictBadge(verdict) }, verdict),
+      ]),
     ]),
     actionsList,
     predictionBlock,
     note,
     execBlock,
+    expBlock,
   ]);
 }
 

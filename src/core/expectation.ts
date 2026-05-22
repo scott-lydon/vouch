@@ -1,0 +1,259 @@
+// Expectation Verifier.
+//
+// After the Executor records `observed_post_state` for each permutation, this
+// module compares it against the Oracle's `expected_post_state`. The "do
+// these describe the same outcome" question is what turns a green Playwright
+// run into actual bug-finding: a permutation that produces a verdict of
+// `pass` in Playwright but a `mismatch` here is a candidate SUT bug.
+//
+// Source selection mirrors the Oracle:
+//   - claude-cli — uses the local Claude CLI; auto-loads vouch/CLAUDE.md.
+//   - anthropic-haiku — direct API; cheapest with sufficient capability.
+//   - heuristic — deterministic substring overlap, no LLM. Coarse but free.
+//
+// The user can A/B sources by passing --verify-source on `vouch campaign`.
+
+import { spawn } from "node:child_process";
+
+import Anthropic from "@anthropic-ai/sdk";
+
+import { type PredictionSource } from "./types.js";
+
+const MODEL = "claude-haiku-4-5-20251001";
+
+export interface ExpectationVerdict {
+  permutation_id: string;
+  /** Did the observed state match the expected state? */
+  match: boolean;
+  /** Source-attributed reasoning. */
+  reasoning: string;
+  /** Same source vocabulary as Prediction. */
+  source: PredictionSource;
+  cost_usd: number;
+  generated_at: string;
+}
+
+export interface VerifyInputs {
+  permutationId: string;
+  expectedPostState: string;
+  observedPostState: string;
+  /** Project context for the LLM prompt. */
+  projectName: string;
+  targetUrl: string;
+}
+
+export async function verifyExpectation(
+  input: VerifyInputs,
+  source: PredictionSource,
+): Promise<ExpectationVerdict> {
+  if (source === "anthropic-haiku") {
+    try {
+      return await verifyWithAnthropic(input);
+    } catch (err) {
+      process.stderr.write(
+        `[vouch/verify] Anthropic call failed for '${input.permutationId}'; ` +
+          `falling back to heuristic. Underlying: ${(err as Error).message}\n`,
+      );
+      return verifyHeuristic(input);
+    }
+  }
+  if (source === "claude-cli") {
+    try {
+      return await verifyWithClaudeCli(input);
+    } catch (err) {
+      process.stderr.write(
+        `[vouch/verify] claude-cli call failed for '${input.permutationId}'; ` +
+          `falling back to heuristic. Underlying: ${(err as Error).message}\n`,
+      );
+      return verifyHeuristic(input);
+    }
+  }
+  return verifyHeuristic(input);
+}
+
+function buildVerifyPrompt(input: VerifyInputs): string {
+  return [
+    `# Assignment`,
+    ``,
+    `You are the Expectation Verifier for Vouch, an agentic Model-Based Testing pipeline.`,
+    `For one permutation, the Oracle predicted what a user would observe after the action sequence.`,
+    `The Executor then actually ran the sequence in a real browser and captured what was actually observed.`,
+    ``,
+    `Your job: tell Vouch whether the two describe the SAME OUTCOME.`,
+    ``,
+    `# Context`,
+    ``,
+    `Project: ${input.projectName}`,
+    `Target URL: ${input.targetUrl}`,
+    ``,
+    `# Expected (Oracle's prediction)`,
+    ``,
+    `"""`,
+    input.expectedPostState,
+    `"""`,
+    ``,
+    `# Observed (Executor's capture from the real browser)`,
+    ``,
+    `"""`,
+    input.observedPostState,
+    `"""`,
+    ``,
+    `# Contract for your response`,
+    ``,
+    `Respond with EXACTLY two lines, in this order:`,
+    `Line 1: the word MATCH or MISMATCH (uppercase, nothing else on the line).`,
+    `Line 2: one sentence (max 40 words) explaining the call. If MISMATCH, name the specific divergence (e.g. "Expected the success toast; observed the error banner with text X").`,
+    ``,
+    `Be strict. Vouch uses your verdict to decide whether a permutation found a real SUT bug. A permutation that should have shown a success message but instead showed nothing is a MISMATCH, not a MATCH-with-caveat.`,
+    ``,
+    `Emit nothing else: no preamble, no markdown, no JSON, just the two lines.`,
+  ].join("\n");
+}
+
+function parseVerdictText(
+  text: string,
+  source: PredictionSource,
+  permutationId: string,
+  cost_usd: number,
+): ExpectationVerdict {
+  const lines = text.trim().split(/\r?\n/);
+  const first = (lines[0] ?? "").trim().toUpperCase();
+  const reasoning = (lines.slice(1).join(" ").trim()) || "(no reasoning provided)";
+  let match: boolean;
+  if (first === "MATCH") match = true;
+  else if (first === "MISMATCH") match = false;
+  else {
+    // Best-effort recovery: scan the response for either keyword.
+    if (/MATCH(?!\w)/.test(text) && !/MISMATCH/.test(text)) match = true;
+    else if (/MISMATCH/.test(text)) match = false;
+    else {
+      throw new Error(
+        `verify: ${source} returned a response that did not contain MATCH or MISMATCH on the first line. ` +
+          `Raw: ${text.slice(0, 200)}`,
+      );
+    }
+  }
+  return {
+    permutation_id: permutationId,
+    match,
+    reasoning,
+    source,
+    cost_usd,
+    generated_at: new Date().toISOString(),
+  };
+}
+
+async function verifyWithAnthropic(input: VerifyInputs): Promise<ExpectationVerdict> {
+  const client = new Anthropic({});
+  const prompt = buildVerifyPrompt(input);
+  const resp = await client.messages.create({
+    model: MODEL,
+    max_tokens: 128,
+    messages: [{ role: "user", content: prompt }],
+  });
+  const text = resp.content
+    .filter((c) => c.type === "text")
+    .map((c) => (c as { text: string }).text)
+    .join("\n")
+    .trim();
+  if (!text) {
+    throw new Error(`Anthropic returned empty response (stop_reason=${resp.stop_reason})`);
+  }
+  const inTok = resp.usage.input_tokens;
+  const outTok = resp.usage.output_tokens;
+  const cost = (inTok / 1_000_000) * 1 + (outTok / 1_000_000) * 5;
+  return parseVerdictText(text, "anthropic-haiku", input.permutationId, Number(cost.toFixed(6)));
+}
+
+async function verifyWithClaudeCli(input: VerifyInputs): Promise<ExpectationVerdict> {
+  const prompt = buildVerifyPrompt(input);
+  const text = await new Promise<string>((resolveCli, rejectCli) => {
+    const child = spawn("claude", ["-p", prompt, "--dangerously-skip-permissions"], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let err = "";
+    let resolved = false;
+    const timer = setTimeout(() => {
+      if (resolved) return;
+      resolved = true;
+      child.kill("SIGKILL");
+      rejectCli(new Error(`claude-cli timed out after 60s for verify of '${input.permutationId}'.`));
+    }, 60_000);
+    child.stdout.on("data", (c: Buffer) => {
+      out += c.toString("utf8");
+    });
+    child.stderr.on("data", (c: Buffer) => {
+      err += c.toString("utf8");
+    });
+    child.on("error", (e: Error) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      rejectCli(new Error(`claude-cli spawn failed: ${e.message}`));
+    });
+    child.on("close", (code: number | null) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        rejectCli(new Error(`claude-cli exited ${code}. stderr: ${err.trim().slice(0, 200)}`));
+        return;
+      }
+      const trimmed = out.trim();
+      if (!trimmed) {
+        rejectCli(new Error(`claude-cli returned empty stdout (exit 0). stderr: ${err.trim().slice(0, 200)}`));
+        return;
+      }
+      resolveCli(trimmed);
+    });
+  });
+  return parseVerdictText(text, "claude-cli", input.permutationId, 0);
+}
+
+/**
+ * Heuristic: substring + token overlap. No LLM. Returns match=true if the
+ * observed post-state contains at least 60% of the "salient" tokens from the
+ * expected (lower-cased, length >= 4, excluding stop-words). The threshold is
+ * intentionally lenient because the heuristic can't reason about semantic
+ * equivalence; we'd rather under-flag than over-flag in the no-LLM case.
+ */
+function verifyHeuristic(input: VerifyInputs): ExpectationVerdict {
+  const stop = new Set([
+    "the", "a", "an", "and", "or", "but", "is", "are", "was", "were", "be", "been",
+    "to", "of", "in", "on", "at", "for", "with", "by", "from", "as", "that", "this",
+    "it", "its", "should", "would", "could", "will", "may", "might", "user",
+  ]);
+  const tokenize = (s: string): string[] =>
+    s
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter((t) => t.length >= 4 && !stop.has(t));
+  const expected = new Set(tokenize(input.expectedPostState));
+  const observed = new Set(tokenize(input.observedPostState));
+  if (expected.size === 0) {
+    return {
+      permutation_id: input.permutationId,
+      match: true,
+      reasoning: "Heuristic: expected text had no salient tokens to check against; cannot disprove match.",
+      source: "heuristic",
+      cost_usd: 0,
+      generated_at: new Date().toISOString(),
+    };
+  }
+  let overlap = 0;
+  for (const t of expected) if (observed.has(t)) overlap++;
+  const ratio = overlap / expected.size;
+  const match = ratio >= 0.6;
+  return {
+    permutation_id: input.permutationId,
+    match,
+    reasoning:
+      `Heuristic: ${overlap}/${expected.size} salient tokens from expected appear in observed (${Math.round(ratio * 100)}%). ` +
+      `Threshold 60%. ${match ? "Match." : "Mismatch."} (For semantic comparison, set ANTHROPIC_API_KEY or install Claude CLI.)`,
+    source: "heuristic",
+    cost_usd: 0,
+    generated_at: new Date().toISOString(),
+  };
+}

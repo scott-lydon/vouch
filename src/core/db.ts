@@ -108,6 +108,18 @@ function applyMigrations(raw: Database.Database): void {
       finished_at         TEXT NOT NULL,
       error_class         TEXT
     );
+
+    -- Expectation verdicts. One row per permutation that has been verified.
+    -- Populated by the verify-expectations pass (off by default; opt in with
+    -- --verify on \`vouch run\` or always-on inside \`vouch campaign\`).
+    CREATE TABLE IF NOT EXISTS expectation_verdicts (
+      permutation_id  TEXT PRIMARY KEY REFERENCES permutations(id) ON DELETE CASCADE,
+      match           INTEGER NOT NULL,  -- 1 = match, 0 = mismatch
+      reasoning       TEXT NOT NULL,
+      source          TEXT NOT NULL,
+      cost_usd        REAL NOT NULL DEFAULT 0,
+      generated_at    TEXT NOT NULL
+    );
   `);
 }
 
@@ -345,6 +357,63 @@ export function upsertExecution(db: DBHandle, e: Execution): void {
       e.finished_at,
       e.error_class,
     );
+}
+
+// ============================================================================
+// Expectation Verdicts
+// ============================================================================
+
+import { type ExpectationVerdict } from "./expectation.js";
+
+export function upsertExpectationVerdict(db: DBHandle, v: ExpectationVerdict): void {
+  db.raw
+    .prepare(
+      `INSERT INTO expectation_verdicts (permutation_id, match, reasoning, source, cost_usd, generated_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(permutation_id) DO UPDATE SET
+         match        = excluded.match,
+         reasoning    = excluded.reasoning,
+         source       = excluded.source,
+         cost_usd     = excluded.cost_usd,
+         generated_at = excluded.generated_at`,
+    )
+    .run(v.permutation_id, v.match ? 1 : 0, v.reasoning, v.source, v.cost_usd, v.generated_at);
+}
+
+export function getExpectationVerdict(db: DBHandle, permutationId: string): ExpectationVerdict | null {
+  const row = db.raw
+    .prepare(`SELECT * FROM expectation_verdicts WHERE permutation_id = ?`)
+    .get(permutationId) as Record<string, unknown> | undefined;
+  if (!row) return null;
+  return {
+    permutation_id: String(row.permutation_id),
+    match: Number(row.match) === 1,
+    reasoning: String(row.reasoning),
+    source: String(row.source) as ExpectationVerdict["source"],
+    cost_usd: Number(row.cost_usd),
+    generated_at: String(row.generated_at),
+  };
+}
+
+export function listExpectationVerdictsForRun(
+  db: DBHandle,
+  runId: string,
+): ExpectationVerdict[] {
+  const rows = db.raw
+    .prepare(
+      `SELECT ev.* FROM expectation_verdicts ev
+       INNER JOIN permutations p ON p.id = ev.permutation_id
+       WHERE p.run_id = ?`,
+    )
+    .all(runId) as Array<Record<string, unknown>>;
+  return rows.map((row) => ({
+    permutation_id: String(row.permutation_id),
+    match: Number(row.match) === 1,
+    reasoning: String(row.reasoning),
+    source: String(row.source) as ExpectationVerdict["source"],
+    cost_usd: Number(row.cost_usd),
+    generated_at: String(row.generated_at),
+  }));
 }
 
 export function getExecution(db: DBHandle, permutationId: string): Execution | null {

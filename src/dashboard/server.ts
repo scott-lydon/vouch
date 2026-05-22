@@ -17,6 +17,7 @@ import express from "express";
 
 import {
   getExecution,
+  getExpectationVerdict,
   getPrediction,
   getProject,
   getRun,
@@ -27,6 +28,7 @@ import {
   openDB,
   updatePredictionNote,
 } from "../core/db.js";
+import { analyzeRun, renderFindingsMarkdown } from "../core/findings.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = resolve(__dirname, "ui");
@@ -66,17 +68,43 @@ export async function startServer(dbPath: string, port: number): Promise<void> {
     const enriched = perms.map((p) => {
       const prediction = getPrediction(db, p.id);
       const execution = getExecution(db, p.id);
+      const expectation = getExpectationVerdict(db, p.id);
       return {
         permutation: p,
         prediction,
         execution,
+        expectation,
         action_descriptions: p.action_ids.map((id) => {
           const a = actions.find((x) => x.id === id);
-          return a ? { id: a.id, kind: a.kind, description: a.description, selector: a.selector } : null;
+          return a
+            ? {
+                id: a.id,
+                kind: a.kind,
+                description: a.description,
+                selector: a.selector,
+                type_value: a.type_value,
+              }
+            : null;
         }),
       };
     });
     res.json({ run, project, actions, permutations: enriched });
+  });
+
+  app.get("/api/runs/:runId/findings", (req, res) => {
+    const run = getRun(db, req.params.runId);
+    if (!run) {
+      res.status(404).json({ error: `run '${req.params.runId}' not found` });
+      return;
+    }
+    const report = analyzeRun(db, run.id);
+    const wantMd = String(req.query.format ?? "").toLowerCase() === "markdown";
+    if (wantMd) {
+      res.set("content-type", "text/markdown; charset=utf-8");
+      res.send(renderFindingsMarkdown(report));
+      return;
+    }
+    res.json(report);
   });
 
   // ---- write endpoint ----

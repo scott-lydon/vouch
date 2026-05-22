@@ -150,11 +150,23 @@ async function viewRun(runId) {
   const { run, project, actions, permutations } = data;
   $crumb.innerHTML = `<a href="#/">Projects</a> &rsaquo; <a href="#/project/${project.id}">${escapeHtml(project.name)}</a> &rsaquo; <strong>${escapeHtml(run.id)}</strong>`;
 
-  const verdictCounts = permutations.reduce((acc, p) => {
-    const v = p.execution?.verdict ?? 'pending';
-    acc[v] = (acc[v] ?? 0) + 1;
-    return acc;
-  }, {});
+  // Primary-verdict counts. This is what the operator actually cares about
+  // and matches the badges on each card below. Playwright-only counts (pass /
+  // fail / timeout) are surfaced as a secondary breakdown so both views are
+  // available without contradicting each other.
+  const primaryCounts = { verified: 0, bug_candidate: 0, flagged: 0, crashed: 0, not_verified: 0, not_executed: 0 };
+  const playwrightCounts = { pass: 0, fail: 0, timeout: 0, infrastructure_error: 0, missing_input: 0, pending: 0 };
+  for (const p of permutations) {
+    const pwVerdict = p.execution?.verdict ?? 'pending';
+    playwrightCounts[pwVerdict] = (playwrightCounts[pwVerdict] ?? 0) + 1;
+    const primary = primaryVerdict(pwVerdict, p.expectation);
+    if (primary.label === 'VERIFIED') primaryCounts.verified++;
+    else if (primary.label === 'BUG CANDIDATE') primaryCounts.bug_candidate++;
+    else if (primary.label === 'FLAGGED (rules)') primaryCounts.flagged++;
+    else if (primary.label === 'CRASHED') primaryCounts.crashed++;
+    else if (primary.label === 'NOT VERIFIED') primaryCounts.not_verified++;
+    else if (primary.label === 'NOT EXECUTED') primaryCounts.not_executed++;
+  }
 
   $app.replaceChildren(
     el('div', {}, [
@@ -190,12 +202,29 @@ async function viewRun(runId) {
         ]),
       ]),
 
-      el('div', { class: 'grid md:grid-cols-5 gap-3 mb-8' }, [
+      // PRIMARY stats — what the operator cares about, matches the cards below.
+      el('div', { class: 'grid md:grid-cols-3 lg:grid-cols-6 gap-3 mb-3' }, [
         statCard('Permutations', permutations.length, 'badge-accent'),
-        statCard('Pass', verdictCounts.pass ?? 0, 'badge-good'),
-        statCard('Fail', verdictCounts.fail ?? 0, 'badge-bad'),
-        statCard('Timeout', verdictCounts.timeout ?? 0, 'badge-warn'),
-        statCard('Prediction', run.prediction_source, run.prediction_source === 'heuristic' ? 'badge-warn' : 'badge-good'),
+        statCard('Verified',     primaryCounts.verified, 'badge-good'),
+        statCard('Bug candidate', primaryCounts.bug_candidate, 'badge-bad'),
+        statCard('Flagged (rules)', primaryCounts.flagged, 'badge-warn'),
+        statCard('Crashed', primaryCounts.crashed, 'badge-bad'),
+        statCard('Source', sourceLabel(run.prediction_source), run.prediction_source === 'heuristic' ? 'badge-warn' : 'badge-good'),
+      ]),
+      // Secondary: raw Playwright-execution breakdown for debugging.
+      el('details', { class: 'text-xs muted mb-8' }, [
+        el('summary', { class: 'cursor-pointer', style: 'list-style:none;' }, 'Step-execution breakdown (what Playwright did, regardless of SUT correctness) ▾'),
+        el('div', { class: 'mt-2 panel p-3', style: 'background: var(--panel2);' }, [
+          el('span', {}, `Steps ran: ${playwrightCounts.pass}`),
+          ' · ',
+          el('span', {}, `Crashed: ${playwrightCounts.fail}`),
+          ' · ',
+          el('span', {}, `Timed out: ${playwrightCounts.timeout}`),
+          ' · ',
+          el('span', {}, `Boot failed: ${playwrightCounts.infrastructure_error}`),
+          el('p', { class: 'mt-2' },
+            'A permutation can have "Steps ran" yet still be a BUG CANDIDATE — that means the actions executed cleanly but the page ended in a state that disagrees with the AI prediction. The cards below show the combined verdict.'),
+        ]),
       ]),
 
       // Actions panel (expandable)
@@ -263,14 +292,14 @@ function primaryVerdict(playwrightVerdict, expectation) {
     return {
       label: 'CRASHED',
       badge: 'badge-bad',
-      explainer: `Playwright threw during one of the steps (verdict='${playwrightVerdict}'). The page didn't reach a final state.`,
+      explainer: `One of the steps failed (${stepsVerdictLabel(playwrightVerdict)}). The page never reached a final state, so there's nothing to verify against the prediction.`,
     };
   }
   if (!expectation) {
     return {
       label: 'NOT VERIFIED',
       badge: 'badge-warn',
-      explainer: 'Playwright ran clean, but the expectation diff pass did not run for this permutation. Run with --verify.',
+      explainer: 'The steps ran clean, but the expectation diff pass did not run for this permutation. Run with --verify to fill in this column.',
     };
   }
   if (expectation.match) {
@@ -318,6 +347,19 @@ function sourceLabel(src) {
   return src || 'unknown';
 }
 
+/**
+ * Human label for the step-execution verdict (what Playwright did). The badge
+ * still uses the same color logic, but the label is in plain terms.
+ */
+function stepsVerdictLabel(v) {
+  if (v === 'pass') return 'ran';
+  if (v === 'fail') return 'crashed';
+  if (v === 'timeout') return 'timed out';
+  if (v === 'infrastructure_error') return 'boot failed';
+  if (v === 'missing_input') return 'missing prior focus';
+  return v;
+}
+
 function renderPermutationCard(p, actions) {
   const playwrightVerdict = p.execution?.verdict ?? 'pending';
   const exp = p.expectation;
@@ -362,7 +404,7 @@ function renderPermutationCard(p, actions) {
             ? el('span', { class: 'muted text-xs' }, `· $${prediction.cost_usd.toFixed(5)}`)
             : (prediction.source === 'claude-cli' ? el('span', { class: 'muted text-xs' }, '· via Claude subscription') : null),
         ]),
-        el('p', { class: 'text-sm' }, prediction.expected_post_state),
+        paraWithInlineCode(prediction.expected_post_state, 'text-sm'),
       ])
     : el('div', { class: 'muted text-xs italic' }, 'No prediction (oracle did not run for this permutation).');
 
@@ -377,7 +419,7 @@ function renderPermutationCard(p, actions) {
     ? el('div', { class: 'panel p-4 mt-3', style: 'background: var(--panel2);' }, [
         el('div', { class: 'flex items-center gap-2 mb-3 flex-wrap' }, [
           el('span', { class: 'text-sm font-semibold' }, 'Observed (what the browser actually showed)'),
-          el('span', { class: 'badge ' + verdictBadge(exec.verdict) }, 'Playwright: ' + exec.verdict),
+          el('span', { class: 'badge ' + verdictBadge(exec.verdict) }, 'Steps: ' + stepsVerdictLabel(exec.verdict)),
           el('span', { class: 'muted text-xs' }, `${exec.step_log.length} step${exec.step_log.length === 1 ? '' : 's'} · ${fmtLocal(exec.started_at)}`),
         ]),
         observedParsed && observedParsed.url
@@ -403,7 +445,7 @@ function renderPermutationCard(p, actions) {
           el('span', { class: 'badge ' + (exp.source === 'heuristic' ? 'badge-warn' : 'badge-good') }, sourceLabel(exp.source)),
           exp.cost_usd > 0 ? el('span', { class: 'muted text-xs' }, `· $${exp.cost_usd.toFixed(5)}`) : null,
         ]),
-        el('p', { class: 'text-xs ' + (exp.match ? 'muted' : (exp.source === 'heuristic' ? 'warn' : 'bad')) }, exp.reasoning),
+        paraWithInlineCode(exp.reasoning, 'text-xs ' + (exp.match ? 'muted' : (exp.source === 'heuristic' ? 'warn' : 'bad'))),
       ])
     : null;
 
@@ -496,6 +538,60 @@ function verdictBadge(v) {
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+/**
+ * Render a string that may contain markdown-style inline code spans
+ * (backtick-delimited) as a DocumentFragment. Code spans become real `<code>`
+ * elements that pick up the dashboard's monospace styling. Text outside
+ * backticks renders as plain text. Backslash-escaped backticks (`\``) are
+ * literal backticks.
+ *
+ * Vouch's LLM outputs (Oracle predictions, Verifier reasoning) routinely cite
+ * selectors, hashes, file paths, and HTML snippets in backticks. Without this
+ * rendering, those appear as raw `` `like this` `` in the dashboard prose,
+ * mixing notation with content. Now they render as monospaced chips inline.
+ *
+ * Single-line scope only — triple-backtick code blocks are not supported and
+ * are passed through as `'```'` literal text, which is the right behavior on
+ * the rare line that has one (we don't want to consume an unbounded amount
+ * of input as a "code block" if the closing fence is missing).
+ */
+function renderInlineCode(text) {
+  const frag = document.createDocumentFragment();
+  if (text === null || text === undefined) return frag;
+  const s = String(text);
+  // Tokenize: a sequence of (escaped backtick | backtick-span | other text).
+  // The regex matches either an escaped backtick (kept literal), a single-
+  // backtick span (non-greedy, no embedded backticks), or a run of non-`/
+  // non-backslash characters. The fall-through `[\s\S]` matches any leftover
+  // single character (e.g. a lone backtick with no closing).
+  const re = /\\`|`([^`]+)`|[^`\\]+|[\s\S]/g;
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    if (m[0] === '\\`') {
+      frag.appendChild(document.createTextNode('`'));
+    } else if (m[1] !== undefined) {
+      const code = document.createElement('code');
+      code.textContent = m[1];
+      frag.appendChild(code);
+    } else {
+      frag.appendChild(document.createTextNode(m[0]));
+    }
+  }
+  return frag;
+}
+
+/**
+ * Convenience for places that want a <p> element with inline-code rendering.
+ * The caller passes className for tailwind / theme classes; the content is
+ * the LLM-produced string.
+ */
+function paraWithInlineCode(text, className = 'text-sm') {
+  const p = document.createElement('p');
+  p.className = className;
+  p.appendChild(renderInlineCode(text));
+  return p;
 }
 
 // ---- router ----

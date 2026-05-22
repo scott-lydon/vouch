@@ -61,4 +61,26 @@ observe in the browser after the final action.
 
 Vouch is an agentic Model-Based Testing pipeline at `~/Desktop/Clutter/iOS/vouch/`. It maps a web page's interactable surface via Playwright, generates depth-N action permutations with rule filtering (type-after-focus), asks an LLM (you, when invoked via `claude-cli` source) for an expected post-state per permutation, and then actually replays each permutation in a fresh browser context to compare observed vs. expected. The dashboard at `http://localhost:7321/` lets the operator review the diffs and edit notes.
 
+## Writing a spec.md for Vouch (read this when asked to draft a spec for a project)
+
+Vouch's verdict engine compares the Oracle's prediction (grounded in the spec) against the Executor's observation (what the page actually showed). A spec that bakes in specific data values — counts, dates, dollar amounts, list lengths — produces predictions that fail verification not because the SUT has a bug, but because the spec was over-specific. That's a false bug.
+
+Rules for writing a Vouch-grade spec:
+
+1. **Describe structure, not specific data.** Say "the summary line displays the count of N items, where N is the number of items currently in storage" not "the summary line says '3 items'." Vouch tests run against real systems with real (varying) data; specific counts make every test a false positive after the data changes.
+
+2. **Name structural anchors that should be present.** Say "the project list contains AT LEAST a card for the project the operator most recently created via `vouch init`" not "the project list shows the sample-form project." The anchor lets the verifier confirm structure without binding to specific data that might change between runs.
+
+3. **Allow valid outcome ranges.** Where the spec defines a range of acceptable behavior (e.g. "any error response that names the validation failure"), say so explicitly. Don't pick one specific error message text if multiple are correct.
+
+4. **Distinguish required from variable.** Be explicit about which parts are invariant (a required button must always be present) and which are variable (the user's avatar URL, the current timestamp, the dollar amount in their wallet). The verifier reads this and grades accordingly.
+
+5. **For lists, name the schema, not the contents.** "Each row in the project list has: a name in semibold, a relative-time badge, an id starting with `proj_`" tells the verifier the shape. Listing the specific projects' names is brittle.
+
+6. **For counts of dynamic collections, prefer N or >=K.** "N projects" (where N is the current count) or "at least 1 project (vouch-dashboard)" beats "3 projects" or "1 project."
+
+7. **Out-of-scope is part of the spec.** A spec that says "the page is silent on responsive behavior" tells the Oracle not to invent a layout prediction; without that, the Oracle will hallucinate one and the verifier will flag the inevitable mismatch as a bug. List explicitly what's out of scope so the Oracle stays grounded.
+
+These rules exist because we learned them the hard way: an early vouch-on-vouch run found a "BUG CANDIDATE" that was actually a brittle spec (specifically "1 project has used Vouch" baked into the spec when 3 projects existed). The system worked correctly — the verifier accurately reported the mismatch between spec and reality. The lesson is on the input side, not the system side.
+
 The architecture site is at `vouch/website/index.html`. The spec docs are at `vouch/constitution.md`, `vouch/spec.md`, `vouch/plan.md`, `vouch/tasks.md`. They were originally written for a Swift orchestrator design that was amended on 2026-05-22 to TypeScript end-to-end; the amendment block is at the top of `constitution.md`.

@@ -19,21 +19,38 @@ import { createHash } from "node:crypto";
 
 import { chromium, type Browser, type Page } from "playwright";
 
+import { waitForInteractableContent } from "./page-utils.js";
 import { type Action, type ActionKind } from "./types.js";
 
 export interface MapOptions {
   /** Per-page navigation + DOM-settle timeout in ms. Default 15s. */
   timeoutMs?: number;
+  /**
+   * Hard cap on the post-navigation settle wait. SPAs (Next.js, React Router,
+   * Vite, the Vouch dashboard) render their interactable content AFTER
+   * `domcontentloaded`. Without waiting, the Mapper sees the loading shell
+   * (typically 0-2 interactables) instead of the real surface. Default 5s.
+   */
+  settleTimeoutMs?: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 15_000;
+const DEFAULT_SETTLE_TIMEOUT_MS = 5_000;
 
 /**
  * Walk the SUT and return discovered actions. Always launches its own browser
  * so a crash mid-walk cannot leave a dangling Playwright process.
+ *
+ * After navigation, waits for the SPA (if any) to render interactable content
+ * before walking the DOM. Vouch 2026-05-22 vouch-on-vouch run found 2 actions
+ * on the dashboard's landing page where 17+ exist; root cause was the Mapper
+ * walking after `domcontentloaded` but before the `fetch('/api/projects')`
+ * resolved and `<main>` got replaced with the rendered project cards. The
+ * settle wait closes that gap.
  */
 export async function mapSurface(targetUrl: string, opts: MapOptions = {}): Promise<Action[]> {
   const timeout = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const settleTimeoutMs = opts.settleTimeoutMs ?? DEFAULT_SETTLE_TIMEOUT_MS;
   let browser: Browser | null = null;
   try {
     browser = await chromium.launch({ headless: true });
@@ -47,6 +64,19 @@ export async function mapSurface(targetUrl: string, opts: MapOptions = {}): Prom
           `Common causes: the URL is not reachable from this host (check VPN, firewall, or that the local dev server is running), ` +
           `or the page exceeded the ${timeout}ms timeout. ` +
           `Underlying error: ${String((err as Error).message ?? err)}`,
+      );
+    }
+    // Settle: wait for SPAs to render before walking. Returns {settled, finalCount}
+    // for logging; the Mapper proceeds in either case so a genuinely sparse page
+    // (or one whose hydration never completes) still gets mapped with whatever
+    // is in the DOM at the cap.
+    const settleResult = await waitForInteractableContent(page, { timeoutMs: settleTimeoutMs });
+    if (!settleResult.settled) {
+      process.stderr.write(
+        `[vouch/surface] settle cap (${settleTimeoutMs}ms) reached on '${targetUrl}'. ` +
+          `Only ${settleResult.finalCount} interactable elements present. ` +
+          `Either the page is genuinely sparse, or its hydration takes longer than the cap. ` +
+          `Mapping what's there. To wait longer, pass --settle-timeout-ms <ms>.\n`,
       );
     }
     return await walkPage(page);

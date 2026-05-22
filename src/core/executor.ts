@@ -21,6 +21,7 @@ import { dirname, resolve } from "node:path";
 
 import { chromium, type Browser } from "playwright";
 
+import { waitForInteractableContent } from "./page-utils.js";
 import { type Action, type Execution, type Permutation, type Verdict } from "./types.js";
 
 export interface ExecuteOptions {
@@ -119,6 +120,18 @@ async function executeOne(
         error_class: errorClass,
       };
     }
+    // Settle: same hydration-wait the Surface Mapper does after goto. Without
+    // it, the executor would try to interact with selectors that exist in the
+    // discovered-actions table (mapped after settle) but don't yet exist in
+    // the page at the moment we navigate fresh for this permutation. The cap
+    // is short (3s) because per-permutation freshness is amortized differently
+    // than per-run mapping — we're paying the cap on every permutation, so
+    // overpaying compounds. 3s is enough for typical SPA hydration on a warm
+    // browser; pages slower than that hit the cap and proceed with whatever
+    // exists, which surfaces as Playwright errors on the first step that
+    // references an unrendered element. Those errors are real bugs (the SUT
+    // takes too long to render) and are the correct thing for Vouch to report.
+    await waitForInteractableContent(page, { timeoutMs: 3_000 });
 
     let activeFocus: ActiveFocus | null = null;
     let stepIdx = 0;

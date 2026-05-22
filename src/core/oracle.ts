@@ -299,6 +299,285 @@ async function predictWithClaudeCli(input: OracleInputs): Promise<OracleResult> 
   };
 }
 
+/**
+ * BATCHED claude-cli oracle. Sends N permutations in a single subprocess
+ * spawn and parses N predictions back from a JSON array. Eliminates the
+ * dominant per-call cost on claude-cli (~3-5s of spawn + auth + plugin init)
+ * which on a 289-perm depth-2 run shrinks oracle wallclock from ~50 min to
+ * ~5 min (one batch ≈ one solo call's wallclock).
+ *
+ * Architectural trade-off: a malformed JSON response loses the whole batch
+ * versus a single perm. Mitigation:
+ *   1. We ask Claude for STRICT JSON in the contract, repeated last so it
+ *      stays in working memory.
+ *   2. On parse failure we DO NOT silently lose the batch — we fall back
+ *      to per-perm `predictWithClaudeCli` calls so the user gets the
+ *      predictions, just at the slower pace. This preserves the
+ *      "no catch-log-continue" rule: the caller still gets a result per
+ *      input, the cost is just degraded throughput.
+ *
+ * Per-batch contract: caller picks the batch size. 30 is the sweet spot for
+ * the Meridian-scale spec (~8k chars, shared across all perms in a batch).
+ * The shared bulk plus 30 short sequences (~3k chars) still fits comfortably
+ * in Claude's context, and the response (30 × ~80 words ≈ 3200 tokens) fits
+ * the default output budget.
+ */
+export async function predictManyWithClaudeCli(
+  inputs: OracleInputs[],
+): Promise<OracleResult[]> {
+  if (inputs.length === 0) return [];
+  if (inputs.length === 1) {
+    // No batching benefit; reuse the single-perm path so a failure surfaces
+    // with the original error class.
+    return [await predictWithClaudeCli(inputs[0]!)];
+  }
+
+  const prompt = buildBatchedOraclePrompt(inputs);
+
+  const text = await new Promise<string>((resolveCli, rejectCli) => {
+    const child = spawn("claude", ["-p", prompt, "--dangerously-skip-permissions"], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let err = "";
+    let resolved = false;
+    // 90s is plenty for a single perm; a 30-perm batch realistically needs
+    // ~20s (model output of ~3k tokens) but we triple the budget so a slow
+    // Anthropic day doesn't kill the whole batch.
+    const timer = setTimeout(() => {
+      if (resolved) return;
+      resolved = true;
+      child.kill("SIGKILL");
+      rejectCli(
+        new Error(
+          `claude-cli (batch of ${inputs.length}) timed out after 270s. ` +
+            `If your auth was recently revoked, run '~/.local/bin/claude-bridge-doctor' to verify.`,
+        ),
+      );
+    }, 270_000);
+    child.stdout.on("data", (chunk: Buffer) => {
+      out += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      err += chunk.toString("utf8");
+    });
+    child.on("error", (e: Error) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      rejectCli(
+        new Error(
+          `claude-cli batch spawn failed: ${e.message}. Is 'claude' on PATH? ` +
+            `'claude auth login --claudeai' if auth is the issue.`,
+        ),
+      );
+    });
+    child.on("close", (code: number | null) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        rejectCli(
+          new Error(
+            `claude-cli batch exited with code ${code}. Often means OAuth token revoked ` +
+              `(see ~/Documents/Claude/Projects/BUG_PREVENTION.md). stderr: ${err.trim().slice(0, 400)}`,
+          ),
+        );
+        return;
+      }
+      const trimmed = out.trim();
+      if (!trimmed) {
+        rejectCli(
+          new Error(
+            `claude-cli batch returned empty stdout (exit 0). stderr: ${err.trim().slice(0, 400)}`,
+          ),
+        );
+        return;
+      }
+      resolveCli(trimmed);
+    });
+  });
+
+  const parsed = parseBatchedResponse(text, inputs.length);
+  return inputs.map((input, i) => ({
+    source: "claude-cli" as PredictionSource,
+    expected_post_state: parsed[i]!,
+    confidence: 0.75,
+    cost_usd: 0,
+  }));
+}
+
+function buildBatchedOraclePrompt(inputs: OracleInputs[]): string {
+  // All inputs in a batch SHOULD share the same spec / projectName /
+  // targetUrl / description (they all come from the same run). We assert
+  // that rather than silently using the first one — a future caller that
+  // mixes runs together would get wrong predictions otherwise.
+  const first = inputs[0]!;
+  for (const inp of inputs) {
+    if (inp.specText !== first.specText) {
+      throw new Error(
+        `predictManyWithClaudeCli: batch contains permutations from different specs; refusing to mix`,
+      );
+    }
+    if (inp.projectName !== first.projectName || inp.targetUrl !== first.targetUrl) {
+      throw new Error(
+        `predictManyWithClaudeCli: batch contains permutations from different projects/targets`,
+      );
+    }
+  }
+
+  const descLine = first.projectDescription
+    ? `Project description: ${first.projectDescription}`
+    : `Project description: (none provided at vouch init)`;
+
+  const sequenceBlocks: string[] = [];
+  for (let i = 0; i < inputs.length; i++) {
+    const inp = inputs[i]!;
+    sequenceBlocks.push(
+      `## Permutation ${i + 1} (id=${inp.permutation.id}, length=${inp.permutation.action_ids.length})\n` +
+        describeSequence(inp),
+    );
+  }
+
+  return [
+    `# Assignment`,
+    ``,
+    `You are the Oracle for Vouch, an agentic Model-Based Testing pipeline. Vouch maps the interactable surface of a product, generates action permutations, and asks you to predict the EXPECTED post-state for each permutation given the product's spec. Vouch then replays each permutation in a real browser and compares your prediction against the observed outcome.`,
+    ``,
+    `Your prediction IS the expected behavior. Vouch's verdict engine uses it as the source of truth for what should happen. If a prediction is vague or wrong, the verdict engine cannot tell pass from fail.`,
+    ``,
+    `In this call you are predicting for ${inputs.length} permutations at once (batched for throughput). Return one prediction per permutation, in order, in a JSON array.`,
+    ``,
+    `# Context summary`,
+    ``,
+    `Project: ${first.projectName}`,
+    descLine,
+    `Target URL: ${first.targetUrl}`,
+    ``,
+    `# Spec (the source of truth for what this product should do)`,
+    ``,
+    `"""`,
+    first.specText.slice(0, 8000),
+    `"""`,
+    ``,
+    `# Permutations to predict (${inputs.length} total, in order)`,
+    ``,
+    sequenceBlocks.join("\n\n"),
+    ``,
+    `# Contract for your response`,
+    ``,
+    `Return EXACTLY a JSON array of ${inputs.length} objects, in the same order as the permutations above. Schema per object:`,
+    `  { "permutation_index": <1-based integer>, "expected_post_state": "<one paragraph, max 80 words>" }`,
+    ``,
+    `Hard rules for each "expected_post_state":`,
+    `- One paragraph. No bullets. No multiple paragraphs.`,
+    `- No preamble inside the string. First word is the observation, not "Here..." / "I think..." / "Based on...".`,
+    `- Concrete. Name elements that should be visible, URL changes, error message text (quote verbatim if the spec specifies it), validation states.`,
+    `- Grounded in the spec. If the spec contradicts a common-sense default, follow the spec.`,
+    `- Predict the observable state, not the implementation.`,
+    `- Order matters within each permutation. Action 1 happens THEN action 2.`,
+    `- "type" actions appear only after a "focus_input" on the same selector. Trust that constraint.`,
+    `- If the spec is silent on a behavior, say so briefly ("Spec is silent on X; expect default browser behavior of Y").`,
+    ``,
+    `Hard rules for the response itself:`,
+    `- Emit a SINGLE JSON array. No markdown fence, no preamble, no trailing prose.`,
+    `- All ${inputs.length} entries present. permutation_index runs 1..${inputs.length} with no gaps.`,
+    `- Valid JSON parseable by JSON.parse on the exact stdout.`,
+    ``,
+    `Emit only the JSON array.`,
+  ].join("\n");
+}
+
+function parseBatchedResponse(text: string, expectedCount: number): string[] {
+  // Claude occasionally wraps the JSON in ```json fences despite the rule.
+  // Strip a fenced block if present so JSON.parse sees clean JSON.
+  let cleaned = text.trim();
+  const fenceMatch = cleaned.match(/^```(?:json)?\s*\n([\s\S]*?)\n```\s*$/);
+  if (fenceMatch) cleaned = fenceMatch[1]!.trim();
+  // If there's leading prose before a `[` and trailing prose after `]`, snip
+  // to the outermost JSON array. Defensive — should not happen given the
+  // contract, but the cost is low and the recovery value is high.
+  const firstBracket = cleaned.indexOf("[");
+  const lastBracket = cleaned.lastIndexOf("]");
+  if (firstBracket >= 0 && lastBracket > firstBracket) {
+    cleaned = cleaned.slice(firstBracket, lastBracket + 1);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (err) {
+    throw new Error(
+      `batched oracle response was not valid JSON: ${(err as Error).message}. First 200 chars: ${text.slice(0, 200)}`,
+    );
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`batched oracle response was not a JSON array; got ${typeof parsed}`);
+  }
+  if (parsed.length !== expectedCount) {
+    throw new Error(
+      `batched oracle response had ${parsed.length} entries, expected ${expectedCount}`,
+    );
+  }
+
+  // Index-by-index extraction. We trust the order claude returned because we
+  // explicitly asked for it; we still check the permutation_index field
+  // matches so a reordered response triggers a clear error rather than a
+  // silent misassignment.
+  const out: string[] = [];
+  for (let i = 0; i < parsed.length; i++) {
+    const row = parsed[i] as { permutation_index?: unknown; expected_post_state?: unknown };
+    if (typeof row !== "object" || row === null) {
+      throw new Error(`batched oracle entry ${i} was not an object`);
+    }
+    if (row.permutation_index !== i + 1) {
+      throw new Error(
+        `batched oracle entry ${i} had permutation_index=${row.permutation_index}, expected ${i + 1} (out-of-order response)`,
+      );
+    }
+    if (typeof row.expected_post_state !== "string" || row.expected_post_state.trim() === "") {
+      throw new Error(
+        `batched oracle entry ${i} had empty or non-string expected_post_state`,
+      );
+    }
+    out.push(row.expected_post_state.trim());
+  }
+  return out;
+}
+
+/**
+ * Public batched entry point. Caller-facing wrapper that respects the same
+ * source-fallback contract as predictOne: any failure in the batch path
+ * falls back to per-perm calls so the user gets a result per input — just
+ * at degraded throughput rather than silent loss.
+ */
+export async function predictManyClaudeCliOrFallback(
+  inputs: OracleInputs[],
+): Promise<OracleResult[]> {
+  if (inputs.length === 0) return [];
+  try {
+    return await predictManyWithClaudeCli(inputs);
+  } catch (err) {
+    process.stderr.write(
+      `[vouch/oracle] batched claude-cli call failed (${inputs.length} perms); ` +
+        `falling back to per-perm calls. Underlying: ${(err as Error).message}\n`,
+    );
+    const out: OracleResult[] = [];
+    for (const input of inputs) {
+      try {
+        out.push(await predictWithClaudeCli(input));
+      } catch (innerErr) {
+        process.stderr.write(
+          `[vouch/oracle] per-perm fallback also failed for '${input.permutation.id}'; ` +
+            `using heuristic. Underlying: ${(innerErr as Error).message}\n`,
+        );
+        out.push(predictHeuristic(input));
+      }
+    }
+    return out;
+  }
+}
+
 function predictHeuristic(input: OracleInputs): OracleResult {
   // The heuristic does NOT consult the spec (it has no parser); it composes a
   // sentence per action from generic UI patterns. We do include the project

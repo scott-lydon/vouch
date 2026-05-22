@@ -23,9 +23,14 @@ import { stdin as input, stdout as output } from "node:process";
 
 import { Command } from "commander";
 
-import { detectOracleSource, predictOne, asPrediction } from "./core/oracle.js";
+import {
+  detectOracleSource,
+  predictOne,
+  predictManyClaudeCliOrFallback,
+  asPrediction,
+} from "./core/oracle.js";
 import { executePermutations } from "./core/executor.js";
-import { verifyExpectation } from "./core/expectation.js";
+import { verifyExpectation, verifyManyClaudeCliOrFallback } from "./core/expectation.js";
 import { analyzeRun, cleanCleanRunScreenshots, renderFindingsMarkdown } from "./core/findings.js";
 import { generatePermutationsWithStats } from "./core/permutations.js";
 import { mapSurface } from "./core/surface.js";
@@ -210,27 +215,67 @@ async function runOneDepth(input: RunOneDepthInputs): Promise<string> {
   process.stdout.write(`[depth ${depth}] running oracle (source=${oracleSource})...\n`);
   const actionsById = new Map(actions.map((a) => [a.id, a]));
   let oracleCost = 0;
-  for (const perm of perms) {
-    const res = await predictOne(
-      {
-        permutation: perm,
-        actionsById,
-        specText: project.spec_text,
-        projectName: project.name,
-        projectDescription: project.description,
-        targetUrl,
-      },
-      oracleSource,
-    );
-    oracleCost += res.cost_usd;
-    const existing = getPrediction(db, perm.id);
-    upsertPrediction(
-      db,
-      asPrediction(perm.id, res, {
-        text: existing?.user_note_text ?? null,
-        editedAt: existing?.user_note_edited_at ?? null,
-      }),
-    );
+  // For the claude-cli source the per-call subprocess spawn dominates the
+  // wallclock (~3-5s out of ~10s per perm), so batching N perms into one
+  // call gives ~Nx speedup on the oracle phase. anthropic-haiku already
+  // pays only ~1s per HTTP round-trip and has no batch endpoint at this
+  // size, so we keep the per-perm loop for it. heuristic is in-process
+  // and instant — no point batching either.
+  if (oracleSource === "claude-cli") {
+    const BATCH_SIZE = 30;
+    const allInputs = perms.map((perm) => ({
+      permutation: perm,
+      actionsById,
+      specText: project.spec_text,
+      projectName: project.name,
+      projectDescription: project.description,
+      targetUrl,
+    }));
+    for (let i = 0; i < allInputs.length; i += BATCH_SIZE) {
+      const batch = allInputs.slice(i, i + BATCH_SIZE);
+      const batchStart = Date.now();
+      const results = await predictManyClaudeCliOrFallback(batch);
+      const elapsedSec = Math.round((Date.now() - batchStart) / 1000);
+      for (let j = 0; j < results.length; j++) {
+        const res = results[j]!;
+        const perm = batch[j]!.permutation;
+        oracleCost += res.cost_usd;
+        const existing = getPrediction(db, perm.id);
+        upsertPrediction(
+          db,
+          asPrediction(perm.id, res, {
+            text: existing?.user_note_text ?? null,
+            editedAt: existing?.user_note_edited_at ?? null,
+          }),
+        );
+      }
+      process.stdout.write(
+        `[depth ${depth}] oracle batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(allInputs.length / BATCH_SIZE)} done (${batch.length} perms in ${elapsedSec}s)\n`,
+      );
+    }
+  } else {
+    for (const perm of perms) {
+      const res = await predictOne(
+        {
+          permutation: perm,
+          actionsById,
+          specText: project.spec_text,
+          projectName: project.name,
+          projectDescription: project.description,
+          targetUrl,
+        },
+        oracleSource,
+      );
+      oracleCost += res.cost_usd;
+      const existing = getPrediction(db, perm.id);
+      upsertPrediction(
+        db,
+        asPrediction(perm.id, res, {
+          text: existing?.user_note_text ?? null,
+          editedAt: existing?.user_note_edited_at ?? null,
+        }),
+      );
+    }
   }
   process.stdout.write(`[depth ${depth}] oracle done (cost ~$${oracleCost.toFixed(4)})\n`);
 
@@ -250,21 +295,55 @@ async function runOneDepth(input: RunOneDepthInputs): Promise<string> {
   if (verify) {
     process.stdout.write(`[depth ${depth}] verifying expectations (source=${verifySource})...\n`);
     let verifyCost = 0;
+    // Build the verify inputs once so the batched + per-perm paths share the
+    // same construction. Skip executions whose perm has no prediction (the
+    // oracle phase may have failed for that perm); without a prediction the
+    // verifier has nothing to compare against.
+    type VerifyJob = {
+      input: import("./core/expectation.js").VerifyInputs;
+      execution: typeof execs[number];
+    };
+    const jobs: VerifyJob[] = [];
     for (const e of execs) {
       const prediction = getPrediction(db, e.permutation_id);
       if (!prediction) continue;
-      const v = await verifyExpectation(
-        {
+      jobs.push({
+        input: {
           permutationId: e.permutation_id,
           expectedPostState: prediction.expected_post_state,
           observedPostState: e.observed_post_state,
           projectName: project.name,
           targetUrl,
         },
-        verifySource,
-      );
-      verifyCost += v.cost_usd;
-      upsertExpectationVerdict(db, v);
+        execution: e,
+      });
+    }
+    if (verifySource === "claude-cli" && jobs.length > 1) {
+      // Same batch sizing as the oracle (30). Same rationale: spec-text is
+      // constant across perms in a batch and dominates input size; output
+      // is shorter than the oracle (a verdict + 1 sentence vs a paragraph),
+      // so 30 fits comfortably in the model's output budget.
+      const BATCH_SIZE = 30;
+      for (let i = 0; i < jobs.length; i += BATCH_SIZE) {
+        const batchJobs = jobs.slice(i, i + BATCH_SIZE);
+        const batchStart = Date.now();
+        const verdicts = await verifyManyClaudeCliOrFallback(batchJobs.map((j) => j.input));
+        const elapsedSec = Math.round((Date.now() - batchStart) / 1000);
+        for (let j = 0; j < verdicts.length; j++) {
+          const v = verdicts[j]!;
+          verifyCost += v.cost_usd;
+          upsertExpectationVerdict(db, v);
+        }
+        process.stdout.write(
+          `[depth ${depth}] verify batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(jobs.length / BATCH_SIZE)} done (${batchJobs.length} perms in ${elapsedSec}s)\n`,
+        );
+      }
+    } else {
+      for (const job of jobs) {
+        const v = await verifyExpectation(job.input, verifySource);
+        verifyCost += v.cost_usd;
+        upsertExpectationVerdict(db, v);
+      }
     }
     process.stdout.write(`[depth ${depth}] verify done (cost ~$${verifyCost.toFixed(4)})\n`);
   }

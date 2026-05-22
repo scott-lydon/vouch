@@ -11,6 +11,9 @@
 //   - expectation_mismatch — verify pass + observed disagrees with expected
 //   - missing_verdict     — verify never ran (informational, not blocking)
 
+import { rmSync } from "node:fs";
+import { dirname } from "node:path";
+
 import {
   getExecution,
   getExpectationVerdict,
@@ -111,19 +114,26 @@ function findingsForPermutation(
     return out; // No point also checking expectation when Playwright crashed.
   }
 
-  // 2. Expectation mismatch
+  // 2. Expectation mismatch — severity depends on the verifier's trust level.
+  //    heuristic source = "warning" (over-flags by design; rendered but does
+  //      not block downstream effects like screenshot retention or prefix
+  //      blocking).
+  //    claude-cli / anthropic-haiku = "blocking" (the verifier reasons
+  //      semantically; a mismatch is a real candidate SUT bug).
   if (execution && verdict && verdict.match === false) {
+    const sev: Finding["severity"] = verdict.source === "heuristic" ? "warning" : "blocking";
     out.push({
       permutation_id: perm.id,
       short_id: short,
       category: "expectation_mismatch",
-      severity: "blocking",
+      severity: sev,
       summary: `Expectation mismatch on ${short}: ${verdict.reasoning.slice(0, 140)}`,
       action_sequence: sequence,
       expected_post_state: prediction?.expected_post_state ?? "(no prediction)",
       observed_post_state: execution.observed_post_state,
       diagnostic:
-        `Source: ${verdict.source}. Reasoning: ${verdict.reasoning}\n\n` +
+        `Source: ${verdict.source}${verdict.source === "heuristic" ? " (over-flags by design; install Claude CLI or set ANTHROPIC_API_KEY for semantic verification)" : ""}.\n` +
+        `Reasoning: ${verdict.reasoning}\n\n` +
         `If the prediction is wrong, edit the operator note on the permutation card and rerun verify. ` +
         `If the SUT is wrong, fix it in the codebase and rerun the same depth to confirm.`,
     });
@@ -251,4 +261,39 @@ function categoryHeading(c: Finding["category"]): string {
     case "missing_verdict":
       return "Permutations with no expectation verdict (informational)";
   }
+}
+
+// ============================================================================
+// Screenshot cleanup. Permutations that produced ZERO blocking findings get
+// their screenshot directory deleted to keep disk usage bounded. Findings
+// permutations keep their evidence forever (until the run is deleted).
+// ============================================================================
+
+export function cleanCleanRunScreenshots(db: DBHandle, runId: string): number {
+  const report = analyzeRun(db, runId);
+  // Build a set of permutation ids that have at least one blocking finding.
+  const flagged = new Set<string>();
+  for (const f of report.findings) {
+    if (f.severity === "blocking") flagged.add(f.permutation_id);
+  }
+  const perms = listPermutationsForRun(db, runId);
+  let deletedCount = 0;
+  for (const p of perms) {
+    if (flagged.has(p.id)) continue;
+    // Locate this permutation's screenshot dir via the execution's step_log.
+    const exec = getExecution(db, p.id);
+    if (!exec) continue;
+    for (const step of exec.step_log) {
+      if (!step.screenshot_path) continue;
+      try {
+        const dir = dirname(step.screenshot_path);
+        rmSync(dir, { recursive: true, force: true });
+        deletedCount++;
+        break; // One dir per permutation; rm covers all steps.
+      } catch {
+        // Best-effort cleanup. Don't fail the run on disk errors.
+      }
+    }
+  }
+  return deletedCount;
 }

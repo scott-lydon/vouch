@@ -21,15 +21,33 @@ export interface PlanOptions {
   depth: number;
   /** Hard cap on emitted sequences. Default 2000. Throws past the cap. */
   maxSequences?: number;
+  /**
+   * Sequences whose action_ids start with any of these prefixes are skipped.
+   * Each prefix is an ordered list of action_ids. Empty array means no
+   * filtering (the default). Used by the campaign loop: after a permutation
+   * fails at depth N, its action_ids become a blocked prefix that filters
+   * depth N+1.
+   */
+  blockedPrefixes?: string[][];
+}
+
+export interface PlanResult {
+  permutations: Permutation[];
+  /** Number of sequences that would have been emitted but were skipped due to a blocked prefix. */
+  blocked_skip_count: number;
 }
 
 const DEFAULT_MAX = 2000;
 
-export function generatePermutations(
+export function generatePermutations(runId: string, actions: Action[], opts: PlanOptions): Permutation[] {
+  return generatePermutationsWithStats(runId, actions, opts).permutations;
+}
+
+export function generatePermutationsWithStats(
   runId: string,
   actions: Action[],
   opts: PlanOptions,
-): Permutation[] {
+): PlanResult {
   if (actions.length === 0) {
     throw new Error(
       `generatePermutations: zero actions discovered for run '${runId}'. ` +
@@ -58,11 +76,39 @@ export function generatePermutations(
     );
   }
 
+  const blockedPrefixes = opts.blockedPrefixes ?? [];
   const out: Permutation[] = [];
   const sequence: string[] = [];
+  let blockedSkipCount = 0;
+
+  /**
+   * Returns true if `sequence` (the full sequence at terminal depth) starts
+   * with any blocked prefix. Prefix-length must be <= sequence.length AND
+   * every element must match.
+   */
+  const startsWithBlocked = (seq: readonly string[]): boolean => {
+    for (const prefix of blockedPrefixes) {
+      if (prefix.length === 0) continue;
+      if (prefix.length > seq.length) continue;
+      let ok = true;
+      for (let i = 0; i < prefix.length; i++) {
+        if (seq[i] !== prefix[i]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return true;
+    }
+    return false;
+  };
 
   function recurse(): void {
     if (sequence.length === opts.depth) {
+      // Apply the blocked-prefix filter at terminal depth. Counted, not silent.
+      if (startsWithBlocked(sequence)) {
+        blockedSkipCount++;
+        return;
+      }
       if (out.length >= maxSeq) {
         throw new Error(
           `generatePermutations: emitted ${out.length} sequences, which exceeds the cap of ${maxSeq}. ` +
@@ -88,7 +134,7 @@ export function generatePermutations(
   }
 
   recurse();
-  return out;
+  return { permutations: out, blocked_skip_count: blockedSkipCount };
 }
 
 /**

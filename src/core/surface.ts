@@ -213,6 +213,8 @@ function plausibleValuesFor(node: RawNode): TypeVariant[] {
       { key: "empty", value: "", description: "empty string (tests required-field validation)" },
       { key: "no_at", value: "not-an-email.com", description: "missing '@' (invalid format)" },
       { key: "no_domain", value: "bad@", description: "missing domain after '@' (invalid format)" },
+      { key: "whitespace_only", value: "   ", description: "whitespace only (catches trim-not-applied)" },
+      { key: "unicode", value: "正常@例え.com", description: "unicode domain + local part" },
     ];
   }
   if (t === "password" || hint.includes("password")) {
@@ -221,6 +223,7 @@ function plausibleValuesFor(node: RawNode): TypeVariant[] {
       { key: "empty", value: "", description: "empty string (tests required-field validation)" },
       { key: "too_short", value: "abc", description: "below typical 8-char minimum" },
       { key: "very_long", value: "x".repeat(200), description: "200 chars (tests maxlength + perf)" },
+      { key: "whitespace_only", value: "        ", description: "whitespace only at minlength (catches trim-not-applied)" },
     ];
   }
   if (t === "number" || hint.includes("age") || hint.includes("count") || hint.includes("number")) {
@@ -228,6 +231,8 @@ function plausibleValuesFor(node: RawNode): TypeVariant[] {
       { key: "positive", value: "42", description: "positive integer" },
       { key: "zero", value: "0", description: "zero (boundary)" },
       { key: "negative", value: "-5", description: "negative integer (some forms reject)" },
+      { key: "very_large", value: "999999999999", description: "very large (tests overflow handling)" },
+      { key: "decimal", value: "3.14", description: "decimal in an integer field" },
     ];
   }
   if (t === "url" || hint.includes("url") || hint.includes("link")) {
@@ -235,6 +240,7 @@ function plausibleValuesFor(node: RawNode): TypeVariant[] {
       { key: "valid", value: "https://example.com", description: "well-formed URL" },
       { key: "empty", value: "", description: "empty string" },
       { key: "not_url", value: "just some text", description: "not a URL (tests format validation)" },
+      { key: "javascript_proto", value: "javascript:alert(1)", description: "javascript: protocol (tests scheme filtering)" },
     ];
   }
   if (t === "tel" || hint.includes("phone") || hint.includes("tel")) {
@@ -248,12 +254,16 @@ function plausibleValuesFor(node: RawNode): TypeVariant[] {
     return [
       { key: "valid", value: "vouch probe", description: "normal search text" },
       { key: "empty", value: "", description: "empty search" },
+      { key: "xss_like", value: "<script>alert('x')</script>", description: "script-injection-looking input (tests output escaping)" },
     ];
   }
   // Default text / textarea.
   return [
     { key: "valid", value: "vouch probe text", description: "normal text input" },
     { key: "empty", value: "", description: "empty string" },
+    { key: "whitespace_only", value: "   ", description: "whitespace only (catches trim-not-applied)" },
+    { key: "unicode", value: "日本語テスト 🚀", description: "unicode + emoji (tests encoding round-trip)" },
+    { key: "xss_like", value: "<script>alert('x')</script>", description: "script-injection-looking input (tests output escaping)" },
   ];
 }
 

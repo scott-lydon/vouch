@@ -120,6 +120,29 @@ function applyMigrations(raw: Database.Database): void {
       cost_usd        REAL NOT NULL DEFAULT 0,
       generated_at    TEXT NOT NULL
     );
+
+    -- Blocked prefixes. After a permutation produces a blocking finding,
+    -- its action_ids sequence is recorded here scoped to the PROJECT. The
+    -- permutation generator filters any sequence whose action_ids start with
+    -- an active (unblocked_at IS NULL) blocked prefix.
+    --
+    -- Rationale: Vouch uses a fresh browser context per permutation, so if
+    -- 'acdc' crashes from fresh state, any sequence that STARTS with acdc
+    -- will replay the same first-4 steps from fresh and hit the same crash.
+    -- The skip lets the campaign keep finding new bugs in parallel branches
+    -- while the operator (or Claude) fixes the discovered one.
+    CREATE TABLE IF NOT EXISTS blocked_prefixes (
+      id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id                 TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      prefix_json                TEXT NOT NULL,
+      reason                     TEXT NOT NULL,  -- 'playwright_failure' | 'expectation_mismatch'
+      blocked_at                 TEXT NOT NULL,
+      blocked_by_run_id          TEXT,
+      blocked_by_permutation_id  TEXT,
+      unblocked_at               TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_blocked_project_active
+      ON blocked_prefixes(project_id, unblocked_at);
   `);
 }
 
@@ -414,6 +437,103 @@ export function listExpectationVerdictsForRun(
     cost_usd: Number(row.cost_usd),
     generated_at: String(row.generated_at),
   }));
+}
+
+// ============================================================================
+// Blocked prefixes
+// ============================================================================
+
+export interface BlockedPrefix {
+  id: number;
+  project_id: string;
+  prefix: string[];
+  reason: "playwright_failure" | "expectation_mismatch";
+  blocked_at: string;
+  blocked_by_run_id: string | null;
+  blocked_by_permutation_id: string | null;
+  unblocked_at: string | null;
+}
+
+/**
+ * Record a new blocked prefix. Idempotent on (project_id, prefix_json) — if a
+ * matching active prefix already exists, returns its id without inserting.
+ * Prevents duplicate entries when the same prefix fails twice across re-runs.
+ */
+export function insertBlockedPrefix(
+  db: DBHandle,
+  args: {
+    projectId: string;
+    prefix: string[];
+    reason: BlockedPrefix["reason"];
+    runId: string;
+    permutationId: string;
+  },
+): number {
+  const prefixJson = JSON.stringify(args.prefix);
+  const existing = db.raw
+    .prepare(
+      `SELECT id FROM blocked_prefixes
+        WHERE project_id = ? AND prefix_json = ? AND unblocked_at IS NULL`,
+    )
+    .get(args.projectId, prefixJson) as { id: number } | undefined;
+  if (existing) return existing.id;
+  const result = db.raw
+    .prepare(
+      `INSERT INTO blocked_prefixes (project_id, prefix_json, reason, blocked_at, blocked_by_run_id, blocked_by_permutation_id, unblocked_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL)`,
+    )
+    .run(args.projectId, prefixJson, args.reason, new Date().toISOString(), args.runId, args.permutationId);
+  return Number(result.lastInsertRowid);
+}
+
+export function listActiveBlockedPrefixes(db: DBHandle, projectId: string): BlockedPrefix[] {
+  const rows = db.raw
+    .prepare(
+      `SELECT * FROM blocked_prefixes
+        WHERE project_id = ? AND unblocked_at IS NULL
+        ORDER BY blocked_at DESC`,
+    )
+    .all(projectId) as Array<Record<string, unknown>>;
+  return rows.map(rowToBlockedPrefix);
+}
+
+export function listAllBlockedPrefixes(db: DBHandle, projectId: string): BlockedPrefix[] {
+  const rows = db.raw
+    .prepare(`SELECT * FROM blocked_prefixes WHERE project_id = ? ORDER BY blocked_at DESC`)
+    .all(projectId) as Array<Record<string, unknown>>;
+  return rows.map(rowToBlockedPrefix);
+}
+
+export function unblockPrefixById(db: DBHandle, blockedId: number): boolean {
+  const r = db.raw
+    .prepare(`UPDATE blocked_prefixes SET unblocked_at = ? WHERE id = ? AND unblocked_at IS NULL`)
+    .run(new Date().toISOString(), blockedId);
+  return r.changes > 0;
+}
+
+export function unblockAllPrefixes(db: DBHandle, projectId: string): number {
+  const r = db.raw
+    .prepare(
+      `UPDATE blocked_prefixes SET unblocked_at = ?
+        WHERE project_id = ? AND unblocked_at IS NULL`,
+    )
+    .run(new Date().toISOString(), projectId);
+  return r.changes;
+}
+
+function rowToBlockedPrefix(row: Record<string, unknown>): BlockedPrefix {
+  return {
+    id: Number(row.id),
+    project_id: String(row.project_id),
+    prefix: JSON.parse(String(row.prefix_json ?? "[]")) as string[],
+    reason: String(row.reason) as BlockedPrefix["reason"],
+    blocked_at: String(row.blocked_at),
+    blocked_by_run_id: row.blocked_by_run_id ? String(row.blocked_by_run_id) : null,
+    blocked_by_permutation_id: row.blocked_by_permutation_id
+      ? String(row.blocked_by_permutation_id)
+      : null,
+    unblocked_at: row.unblocked_at ? String(row.unblocked_at) : null,
+  };
 }
 
 export function getExecution(db: DBHandle, permutationId: string): Execution | null {

@@ -26,8 +26,8 @@ import { Command } from "commander";
 import { detectOracleSource, predictOne, asPrediction } from "./core/oracle.js";
 import { executePermutations } from "./core/executor.js";
 import { verifyExpectation } from "./core/expectation.js";
-import { analyzeRun, renderFindingsMarkdown } from "./core/findings.js";
-import { generatePermutations } from "./core/permutations.js";
+import { analyzeRun, cleanCleanRunScreenshots, renderFindingsMarkdown } from "./core/findings.js";
+import { generatePermutationsWithStats } from "./core/permutations.js";
 import { mapSurface } from "./core/surface.js";
 import {
   finalizeRun,
@@ -36,12 +36,17 @@ import {
   getProjectByName,
   getRun,
   insertActions,
+  insertBlockedPrefix,
   insertPermutations,
   insertProject,
   insertRun,
   listActionsForRun,
+  listActiveBlockedPrefixes,
+  listAllBlockedPrefixes,
   listPermutationsForRun,
   openDB,
+  unblockAllPrefixes,
+  unblockPrefixById,
   upsertExecution,
   upsertExpectationVerdict,
   upsertPrediction,
@@ -144,6 +149,8 @@ interface RunOneDepthInputs {
   oracleSource: PredictionSource;
   verify: boolean;
   verifySource: PredictionSource;
+  /** Capture per-step PNG screenshots; cleaned up on clean permutations. */
+  screenshots: boolean;
 }
 
 /**
@@ -183,10 +190,21 @@ async function runOneDepth(input: RunOneDepthInputs): Promise<string> {
   insertActions(db, runId, actions);
   process.stdout.write(`[depth ${depth}] discovered ${actions.length} actions\n`);
 
-  const perms = generatePermutations(runId, actions, { depth, maxSequences: maxSeq });
+  const activeBlocks = listActiveBlockedPrefixes(db, project.id);
+  const blockedPrefixes = activeBlocks.map((b) => b.prefix);
+  const planResult = generatePermutationsWithStats(runId, actions, {
+    depth,
+    maxSequences: maxSeq,
+    blockedPrefixes,
+  });
+  const perms = planResult.permutations;
   insertPermutations(db, perms);
   process.stdout.write(
-    `[depth ${depth}] generated ${perms.length} permutations (depth=${depth}, after rule filtering)\n`,
+    `[depth ${depth}] generated ${perms.length} permutations (depth=${depth}, after rule filtering)` +
+      (activeBlocks.length > 0
+        ? ` and skipped ${planResult.blocked_skip_count} via ${activeBlocks.length} active blocked prefix${activeBlocks.length === 1 ? "" : "es"}`
+        : ``) +
+      `\n`,
   );
 
   process.stdout.write(`[depth ${depth}] running oracle (source=${oracleSource})...\n`);
@@ -217,7 +235,11 @@ async function runOneDepth(input: RunOneDepthInputs): Promise<string> {
   process.stdout.write(`[depth ${depth}] oracle done (cost ~$${oracleCost.toFixed(4)})\n`);
 
   process.stdout.write(`[depth ${depth}] executing permutations...\n`);
-  const execs = await executePermutations(perms, actionsById, { targetUrl });
+  const screenshotsDir = input.screenshots ? resolve(process.cwd(), "runs", runId, "screenshots") : null;
+  const execs = await executePermutations(perms, actionsById, {
+    targetUrl,
+    screenshotsDir,
+  });
   for (const e of execs) upsertExecution(db, e);
   const counts = execs.reduce<Record<string, number>>((acc, e) => {
     acc[e.verdict] = (acc[e.verdict] ?? 0) + 1;
@@ -247,6 +269,14 @@ async function runOneDepth(input: RunOneDepthInputs): Promise<string> {
     process.stdout.write(`[depth ${depth}] verify done (cost ~$${verifyCost.toFixed(4)})\n`);
   }
   finalizeRun(db, runId, nowIso());
+
+  // Screenshot cleanup: delete dirs for permutations that produced zero
+  // blocking findings. Keeps disk usage bounded; preserves evidence for the
+  // ones that matter.
+  if (input.screenshots) {
+    const deleted = cleanCleanRunScreenshots(db, runId);
+    process.stdout.write(`[depth ${depth}] screenshots: kept evidence on findings, deleted ${deleted} clean perm dirs\n`);
+  }
   return runId;
 }
 
@@ -263,6 +293,7 @@ program
     "Prediction source: anthropic-haiku (default if ANTHROPIC_API_KEY set), claude-cli (use local Claude subscription, slower), or heuristic (deterministic fallback)",
   )
   .option("--verify", "Also run the expectation-diff pass (LLM compares observed vs expected)")
+  .option("--no-screenshots", "Skip per-step PNG capture. Default: on; clean perms get their dir deleted after analysis.")
   .action(
     async (opts: {
       project: string;
@@ -271,6 +302,7 @@ program
       maxSequences: string;
       oracle?: string;
       verify?: boolean;
+      screenshots: boolean;
     }) => {
       const db = openDB(DB_PATH);
       const project = getProjectByName(db, opts.project);
@@ -305,6 +337,7 @@ program
         oracleSource: source,
         verify: !!opts.verify,
         verifySource: source,
+        screenshots: opts.screenshots !== false,
       });
       process.stdout.write(
         `[vouch/run ${runId}] view at:  vouch serve  → http://localhost:7321/#/run/${runId}\n`,
@@ -334,6 +367,7 @@ program
   )
   .option("--no-pause", "Run all depths back-to-back without prompting for input.")
   .option("--no-verify", "Skip the expectation-diff pass (saves LLM calls but no bug detection).")
+  .option("--no-screenshots", "Skip per-step PNG capture.")
   .action(
     async (opts: {
       project: string;
@@ -344,6 +378,7 @@ program
       verifySource?: string;
       pause: boolean;
       verify: boolean;
+      screenshots: boolean;
     }) => {
       const maxDepth = parseInt(opts.maxDepth, 10);
       if (!Number.isFinite(maxDepth) || maxDepth < 1 || maxDepth > 8) {
@@ -396,9 +431,46 @@ program
               oracleSource,
               verify: opts.verify,
               verifySource,
+              screenshots: opts.screenshots !== false,
             });
 
             const report = analyzeRun(db, runId);
+
+            // Record blocking finding prefixes as blocked. Trust model:
+            //   playwright_failure (crash) — ALWAYS blocks. A crash from a
+            //   fresh-state prefix is a deterministic bug; extending it can't
+            //   help and only burns LLM + Playwright budget.
+            //   expectation_mismatch — blocks ONLY when the verifier source
+            //   is trustworthy (claude-cli or anthropic-haiku). The heuristic
+            //   source over-flags by design (token overlap, no semantics), so
+            //   trusting its mismatches blocks the entire campaign after
+            //   depth 1. Operators who explicitly opt in with
+            //   --block-on-heuristic-mismatch override this.
+            let newBlocks = 0;
+            for (const f of report.findings) {
+              if (f.severity !== "blocking") continue;
+              if (f.category === "playwright_failure") {
+                // Always trustworthy.
+              } else if (f.category === "expectation_mismatch") {
+                if (verifySource === "heuristic") continue;
+              } else {
+                continue;
+              }
+              const actionIds = f.action_sequence.map((a) => a.id);
+              if (actionIds.length === 0) continue;
+              const existed = listActiveBlockedPrefixes(db, project.id).some(
+                (b) => JSON.stringify(b.prefix) === JSON.stringify(actionIds),
+              );
+              insertBlockedPrefix(db, {
+                projectId: project.id,
+                prefix: actionIds,
+                reason: f.category,
+                runId,
+                permutationId: f.permutation_id,
+              });
+              if (!existed) newBlocks++;
+            }
+
             const md = renderFindingsMarkdown(report);
             const reportPath = resolve(reportDir, `${runId}.findings.md`);
             writeFileSync(reportPath, md, "utf8");
@@ -407,6 +479,7 @@ program
               `  permutations: ${report.permutation_count}\n` +
                 `  blocking:     ${report.blocking_count}\n` +
                 `  warnings:     ${report.warning_count}\n` +
+                `  new blocks:   ${newBlocks} (skipped at deeper depths until 'vouch unblock')\n` +
                 `  report:       ${reportPath}\n` +
                 `  dashboard:    http://localhost:7321/#/run/${runId}\n`,
             );
@@ -453,6 +526,53 @@ program
       }
     },
   );
+
+// ----- blocks (list active blocked prefixes for a project) -----
+program
+  .command("blocks")
+  .description("List active blocked prefixes for a project. These are sequences that produced findings and are skipped at deeper depths until unblocked.")
+  .requiredOption("--project <name>", "Project name")
+  .option("--all", "Include already-unblocked entries (history)")
+  .action(async (opts: { project: string; all?: boolean }) => {
+    const db = openDB(DB_PATH);
+    const project = getProjectByName(db, opts.project);
+    if (!project) throw new Error(`Project '${opts.project}' not found.`);
+    const rows = opts.all ? listAllBlockedPrefixes(db, project.id) : listActiveBlockedPrefixes(db, project.id);
+    if (rows.length === 0) {
+      process.stdout.write(`(no ${opts.all ? "" : "active "}blocked prefixes for ${project.name})\n`);
+      return;
+    }
+    for (const b of rows) {
+      const status = b.unblocked_at ? `[unblocked ${b.unblocked_at}]` : `[active]`;
+      const short = b.blocked_by_permutation_id?.split("__").pop() ?? "?";
+      process.stdout.write(
+        `  ${status.padEnd(35)} #${b.id}  ${b.reason.padEnd(22)}  ${short}  prefix=${JSON.stringify(b.prefix)}\n`,
+      );
+    }
+  });
+
+// ----- unblock (clear blocked prefixes once fixes land) -----
+program
+  .command("unblock")
+  .description("Mark blocked prefix(es) as unblocked. Use after fixing the SUT bug they discovered.")
+  .requiredOption("--project <name>", "Project name")
+  .option("--id <n>", "Unblock a specific block id (see 'vouch blocks')")
+  .option("--all", "Unblock ALL active prefixes for the project")
+  .action(async (opts: { project: string; id?: string; all?: boolean }) => {
+    if (!opts.id && !opts.all) {
+      throw new Error(`unblock: pass --id <n> for a specific block, or --all to clear them all.`);
+    }
+    const db = openDB(DB_PATH);
+    const project = getProjectByName(db, opts.project);
+    if (!project) throw new Error(`Project '${opts.project}' not found.`);
+    if (opts.id) {
+      const ok = unblockPrefixById(db, parseInt(opts.id, 10));
+      process.stdout.write(ok ? `unblocked #${opts.id}\n` : `#${opts.id} was not active (already unblocked or unknown).\n`);
+      return;
+    }
+    const n = unblockAllPrefixes(db, project.id);
+    process.stdout.write(`unblocked ${n} prefix${n === 1 ? "" : "es"} for ${project.name}\n`);
+  });
 
 // ----- serve -----
 program

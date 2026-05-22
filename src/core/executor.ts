@@ -16,6 +16,9 @@
 // Fresh context per permutation is the constitution's invariant for sequence
 // isolation; reusing a context would let permutation N see state from N-1.
 
+import { mkdirSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+
 import { chromium, type Browser } from "playwright";
 
 import { type Action, type Execution, type Permutation, type Verdict } from "./types.js";
@@ -26,6 +29,14 @@ export interface ExecuteOptions {
   stepTimeoutMs?: number;
   /** Navigation timeout for goto(). Default 15s. */
   navTimeoutMs?: number;
+  /**
+   * If set, captures a PNG screenshot after each step into
+   * `<screenshotsDir>/<perm_id>/step-<n>.png`. The findings analyzer is
+   * responsible for cleaning up screenshots from permutations that didn't
+   * produce blocking findings (`cleanCleanRunScreenshots` in findings.ts).
+   * Default OFF when this option is absent; the CLI defaults it ON.
+   */
+  screenshotsDir?: string | null;
 }
 
 const DEFAULT_STEP_TIMEOUT_MS = 8_000;
@@ -48,13 +59,24 @@ export async function executePermutations(
 ): Promise<Execution[]> {
   const stepTimeout = opts.stepTimeoutMs ?? DEFAULT_STEP_TIMEOUT_MS;
   const navTimeout = opts.navTimeoutMs ?? DEFAULT_NAV_TIMEOUT_MS;
+  const screenshotsDir = opts.screenshotsDir ?? null;
   const out: Execution[] = [];
 
   let browser: Browser | null = null;
   try {
     browser = await chromium.launch({ headless: true });
     for (const perm of permutations) {
-      out.push(await executeOne(browser, perm, actionsById, opts.targetUrl, stepTimeout, navTimeout));
+      out.push(
+        await executeOne(
+          browser,
+          perm,
+          actionsById,
+          opts.targetUrl,
+          stepTimeout,
+          navTimeout,
+          screenshotsDir,
+        ),
+      );
     }
   } finally {
     if (browser) await browser.close();
@@ -69,6 +91,7 @@ async function executeOne(
   targetUrl: string,
   stepTimeout: number,
   navTimeout: number,
+  screenshotsDir: string | null,
 ): Promise<Execution> {
   const startedAt = new Date().toISOString();
   const stepLog: Execution["step_log"] = [];
@@ -98,6 +121,7 @@ async function executeOne(
     }
 
     let activeFocus: ActiveFocus | null = null;
+    let stepIdx = 0;
     for (const actionId of perm.action_ids) {
       const action = actionsById.get(actionId);
       const stepStart = new Date().toISOString();
@@ -109,11 +133,14 @@ async function executeOne(
           finished_at: new Date().toISOString(),
           ok: false,
           error_message: `Unknown action id '${actionId}' (not present in this run's actions table).`,
+          screenshot_path: null,
         });
         verdict = "infrastructure_error";
         errorClass = "unknown_action_id";
         break;
       }
+      let stepOk = true;
+      let stepErr: string | null = null;
       try {
         await playStep(page, action, activeFocus, stepTimeout);
         if (action.kind === "focus_input") {
@@ -121,29 +148,25 @@ async function executeOne(
         } else {
           activeFocus = null;
         }
-        stepLog.push({
-          action_id: actionId,
-          kind: action.kind,
-          started_at: stepStart,
-          finished_at: new Date().toISOString(),
-          ok: true,
-          error_message: null,
-        });
       } catch (err) {
-        const msg = (err as Error).message;
-        const isTimeout = /Timeout|timeout/i.test(msg);
-        stepLog.push({
-          action_id: actionId,
-          kind: action.kind,
-          started_at: stepStart,
-          finished_at: new Date().toISOString(),
-          ok: false,
-          error_message: msg,
-        });
+        stepOk = false;
+        stepErr = (err as Error).message;
+        const isTimeout = /Timeout|timeout/i.test(stepErr);
         verdict = isTimeout ? "timeout" : "fail";
         errorClass = isTimeout ? "playwright_timeout" : "playwright_action_error";
-        break;
       }
+      const shotPath = await maybeScreenshot(page, screenshotsDir, perm.id, stepIdx);
+      stepLog.push({
+        action_id: actionId,
+        kind: action.kind,
+        started_at: stepStart,
+        finished_at: new Date().toISOString(),
+        ok: stepOk,
+        error_message: stepErr,
+        screenshot_path: shotPath,
+      });
+      stepIdx++;
+      if (!stepOk) break;
     }
 
     observedPostState = await observePostState(page);
@@ -219,6 +242,30 @@ async function playStep(
       await page.setViewportSize({ width: w, height: h });
       return;
     }
+  }
+}
+
+/**
+ * Capture a PNG after the given step ran. Returns absolute path on disk or
+ * null if screenshots are off. We always try the capture even when the step
+ * threw — the screenshot of the failed state is the most useful evidence.
+ */
+async function maybeScreenshot(
+  page: import("playwright").Page,
+  screenshotsDir: string | null,
+  permId: string,
+  stepIdx: number,
+): Promise<string | null> {
+  if (!screenshotsDir) return null;
+  const dir = resolve(screenshotsDir, permId);
+  try {
+    mkdirSync(dir, { recursive: true });
+    const path = resolve(dir, `step-${String(stepIdx).padStart(2, "0")}.png`);
+    await page.screenshot({ path, fullPage: false, timeout: 5_000 });
+    return path;
+  } catch {
+    // Best-effort. A screenshot failure should never poison the run.
+    return null;
   }
 }
 

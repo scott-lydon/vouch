@@ -125,6 +125,15 @@ export const ExecutionSchema = z.object({
       finished_at: z.string(),
       ok: z.boolean(),
       error_message: z.string().nullable().default(null),
+      /**
+       * Absolute path to the PNG screenshot taken AFTER this step executed.
+       * Populated when the executor's screenshot mode is on (default).
+       * Cleaned up (deleted from disk) for permutations that complete without
+       * any blocking finding, to bound disk usage. Findings analyzer flips
+       * to "preserve" for permutations with at least one blocking finding so
+       * the dashboard can render the evidence.
+       */
+      screenshot_path: z.string().nullable().default(null),
     }),
   ),
   observed_post_state: z.string(),

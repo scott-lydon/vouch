@@ -1,0 +1,11 @@
+node_modules/
+dist/
+runs/
+vouch.db
+vouch.db-journal
+vouch.db-wal
+vouch.db-shm
+.env
+.env.local
+*.log
+.DS_Store

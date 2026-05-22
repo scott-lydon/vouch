@@ -1,0 +1,684 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Vouch — Agentic Model-Based Testing</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0a0e1a;
+    --bg2: #121826;
+    --panel: #1a2236;
+    --panel2: #232d44;
+    --accent: #6366f1;
+    --accent2: #818cf8;
+    --good: #34d399;
+    --warn: #fbbf24;
+    --bad: #f87171;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --border: #2d3a55;
+  }
+  html, body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; scroll-behavior: smooth; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; }
+  .panel-hover:hover { border-color: var(--accent2); transform: translateY(-2px); transition: all 0.2s; }
+  .accent-text { color: var(--accent2); }
+  .good { color: var(--good); }
+  .warn { color: var(--warn); }
+  .bad { color: var(--bad); }
+  .muted { color: var(--muted); }
+  .mermaid { background: var(--panel); border-radius: 12px; padding: 24px; border: 1px solid var(--border); }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid var(--border); padding: 12px 16px; text-align: left; vertical-align: top; }
+  th { background: var(--panel2); font-weight: 600; }
+  tr:nth-child(even) td { background: rgba(35, 45, 68, 0.4); }
+  code { background: var(--panel2); padding: 2px 8px; border-radius: 4px; font-family: "JetBrains Mono", Menlo, Monaco, Consolas, monospace; font-size: 0.9em; }
+  pre { background: var(--panel2); padding: 16px; border-radius: 8px; overflow-x: auto; border: 1px solid var(--border); }
+  pre code { background: transparent; padding: 0; }
+  .nav-link { color: var(--muted); transition: color 0.15s; }
+  .nav-link:hover { color: var(--accent2); }
+  .section-anchor { scroll-margin-top: 80px; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 0.75rem; font-weight: 600; }
+  .badge-good { background: rgba(52, 211, 153, 0.15); color: var(--good); border: 1px solid rgba(52, 211, 153, 0.3); }
+  .badge-warn { background: rgba(251, 191, 36, 0.15); color: var(--warn); border: 1px solid rgba(251, 191, 36, 0.3); }
+  .badge-bad { background: rgba(248, 113, 113, 0.15); color: var(--bad); border: 1px solid rgba(248, 113, 113, 0.3); }
+  .gradient-text { background: linear-gradient(135deg, #818cf8 0%, #34d399 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+  .grid-pattern { background-image: linear-gradient(rgba(99, 102, 241, 0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(99, 102, 241, 0.05) 1px, transparent 1px); background-size: 24px 24px; }
+  .comp-card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 24px; transition: all 0.2s; }
+  .comp-card:hover { border-color: var(--accent2); transform: translateY(-2px); }
+  .comp-card h3 { display: flex; align-items: center; gap: 10px; }
+  .comp-card img { width: 22px; height: 22px; }
+  .icon { width: 24px; height: 24px; }
+  .stack-card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; display: flex; align-items: center; gap: 12px; }
+  .stack-card img { width: 28px; height: 28px; }
+  .pro { color: var(--good); }
+  .con { color: var(--warn); }
+</style>
+</head>
+<body class="min-h-screen">
+
+<!-- Sticky nav -->
+<nav class="sticky top-0 z-50 backdrop-blur-md" style="background: rgba(10, 14, 26, 0.85); border-bottom: 1px solid var(--border);">
+  <div class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="w-8 h-8 rounded-lg flex items-center justify-center font-bold text-white" style="background: linear-gradient(135deg, #6366f1 0%, #34d399 100%);">V</div>
+      <span class="font-bold text-lg">Vouch</span>
+      <span class="badge badge-warn">pre-bootstrap</span>
+    </div>
+    <div class="hidden md:flex gap-6 text-sm">
+      <a href="#problem" class="nav-link">Problem</a>
+      <a href="#architecture" class="nav-link">Architecture</a>
+      <a href="#components" class="nav-link">Components</a>
+      <a href="#dataflow" class="nav-link">Data flow</a>
+      <a href="#decisions" class="nav-link">Decisions</a>
+      <a href="#tradeoffs" class="nav-link">Trade-offs</a>
+      <a href="#cost" class="nav-link">Cost</a>
+      <a href="#stack" class="nav-link">Stack</a>
+      <a href="runs.html" class="nav-link" style="color: var(--accent2);">Runs &rarr;</a>
+    </div>
+  </div>
+</nav>
+
+<!-- Hero -->
+<header class="grid-pattern">
+  <div class="max-w-7xl mx-auto px-6 py-20">
+    <div class="max-w-4xl">
+      <span class="badge badge-good mb-4 inline-block">Live. End-to-end pipeline shipped 2026-05-22.</span>
+      <p class="text-sm muted mb-3">Architecture amended 2026-05-22: original Swift design was swapped for TypeScript + Node + Playwright in a single language for performance and to eliminate the cross-language NDJSON subprocess boundary. Persistence is still SQLite. The amendment is documented in <code>constitution.md</code>.</p>
+      <h1 class="text-6xl font-bold mb-6 leading-tight">
+        <span class="gradient-text">Vouch</span>
+      </h1>
+      <p class="text-2xl mb-4" style="color: var(--text);">Agentic Model-Based Testing pipeline.</p>
+      <p class="text-lg muted mb-8 leading-relaxed">
+        A developer hands off a built artifact (a URL, an iOS <code>.app</code>, an Android <code>.apk</code>, or a screenshot) plus the System Under Test's spec. Vouch deterministically enumerates the interactable surface, learns the Finite State Machine (FSM) over actions purely from observation, asks a cheap Large Language Model to translate the spec into a post-condition predicate per action, runs all permutations against fresh System Under Test instances in a background worker, and reports verdicts. Classical Model-Based Testing requires humans to write both the FSM and the oracles; Vouch infers both. The developer never authors a transition rule.
+      </p>
+      <div class="flex flex-wrap gap-3">
+        <a href="https://github.com/scott-lydon/vouch" class="px-5 py-2.5 rounded-lg font-medium" style="background: var(--accent); color: white;">GitHub</a>
+        <a href="https://labs.gauntletai.com/scottlydon/vouch" class="px-5 py-2.5 rounded-lg font-medium border" style="border-color: var(--border); color: var(--text);">GitLab</a>
+        <a href="runs.html" class="px-5 py-2.5 rounded-lg font-medium border" style="border-color: var(--border); color: var(--text);">View runs &rarr;</a>
+        <a href="#architecture" class="px-5 py-2.5 rounded-lg font-medium border" style="border-color: var(--border); color: var(--text);">Explore architecture</a>
+      </div>
+    </div>
+
+    <!-- Live stats reflecting the MVP that shipped 2026-05-22. -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mt-16">
+      <div class="panel p-5">
+        <div class="text-3xl font-bold accent-text">51</div>
+        <div class="text-sm muted mt-1">Permutations executed in the first real run (depth 2, against the bundled fixture form)</div>
+      </div>
+      <div class="panel p-5">
+        <div class="text-3xl font-bold accent-text">9</div>
+        <div class="text-sm muted mt-1">Actions discovered by the Surface Mapper on the fixture (button, select, checkbox, plus focus_input + type pairs for email/password)</div>
+      </div>
+      <div class="panel p-5">
+        <div class="text-3xl font-bold accent-text">1 click</div>
+        <div class="text-sm muted mt-1">Run <code>vouch serve</code> and open <a href="http://localhost:7321/" class="accent-text" style="text-decoration:underline;">localhost:7321</a> to browse runs + edit operator notes</div>
+      </div>
+      <div class="panel p-5">
+        <div class="text-3xl font-bold accent-text">0</div>
+        <div class="text-sm muted mt-1">Developer-authored rules ever (rule authorship is the inducer's; non-negotiable)</div>
+      </div>
+    </div>
+
+    <!-- The architectural identity in one panel -->
+    <div class="panel p-6 mt-8" style="border-left: 4px solid var(--accent);">
+      <div class="text-sm muted mb-2">The architectural identity</div>
+      <div class="text-lg font-semibold mb-3">Two feedback loops, one strict invariant.</div>
+      <ul class="list-disc list-inside text-sm space-y-1 muted">
+        <li><span class="font-semibold accent-text">Learning loop (left):</span> the Rule Inducer reads surface deltas from the Executor and feeds the Sequence Enumerator on the next run. Each pass gets a denser FSM without anyone editing YAML.</li>
+        <li><span class="font-semibold accent-text">Audit loop (right):</span> every stage writes to SQLite. A grep through <code>vouch.db</code> can always answer "why is this rule in its current status."</li>
+        <li><span class="font-semibold accent-text">The invariant:</span> the developer never authors a transition rule. If a contributor proposes <code>vouch.rules.yaml</code>, the change is rejected at review. The whole point is to discover the FSM rather than declare it.</li>
+      </ul>
+    </div>
+  </div>
+</header>
+
+<!-- Problem -->
+<section id="problem" class="section-anchor py-20">
+  <div class="max-w-7xl mx-auto px-6">
+    <h2 class="text-4xl font-bold mb-4">The problem this addresses</h2>
+    <p class="text-lg muted mb-12 max-w-3xl">Classical Model-Based Testing has two human-authored prerequisites: the developer hand-writes the Finite State Machine and the test author hand-writes the oracles. The activation energy is high enough that almost no one uses Model-Based Testing in practice. Hand-written tests catch the path the test author thought of; Model-Based Testing catches the permutations they didn't.</p>
+
+    <div class="grid md:grid-cols-2 gap-6">
+      <div class="panel p-6 panel-hover">
+        <div class="badge badge-bad mb-3">Without Vouch</div>
+        <h3 class="text-xl font-semibold mb-3">Classical Model-Based Testing</h3>
+        <ul class="space-y-2 muted">
+          <li>&bull; Developer hand-writes the FSM in YAML or DSL</li>
+          <li>&bull; Test author hand-writes oracle per action</li>
+          <li>&bull; FSM goes stale within a week of the next refactor</li>
+          <li>&bull; Spec drift invalidates oracles silently</li>
+          <li>&bull; Activation energy is high; teams don't adopt</li>
+          <li>&bull; The path the test author imagined is the only path covered</li>
+        </ul>
+      </div>
+      <div class="panel p-6 panel-hover" style="border-color: var(--good);">
+        <div class="badge badge-good mb-3">With Vouch</div>
+        <h3 class="text-xl font-semibold mb-3">Agentic, inferred Model-Based Testing</h3>
+        <ul class="space-y-2 muted">
+          <li class="good">&bull; FSM is discovered by the Rule Inducer purely from observation</li>
+          <li class="good">&bull; Oracles inferred from <code>spec.md</code> by a cheap Large Language Model (Haiku)</li>
+          <li class="good">&bull; Cache key includes <code>spec_version</code>, so spec edits invalidate the right oracles automatically</li>
+          <li class="good">&bull; Rules promote only after 10 confirmations across 3 distinct runs and 2 calendar days</li>
+          <li class="good">&bull; Pairwise enumeration covers most multi-step regressions for a fraction of the cost</li>
+          <li class="good">&bull; Clash Arbiter classifies a rule break as regression vs. intentional spec evolution</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Architecture topology -->
+<section id="architecture" class="section-anchor py-20" style="background: var(--bg2);">
+  <div class="max-w-7xl mx-auto px-6">
+    <h2 class="text-4xl font-bold mb-4">Architecture topology</h2>
+    <p class="text-lg muted mb-12 max-w-3xl">Six components arranged as a downward main spine with one learning feedback loop on the left (Rule Inducer &rarr; Sequence Enumerator) and one side-channel on the right (every stage writes to SQLite). The Clash Arbiter is triggered by the Rule Inducer when a promoted rule starts to deny. The persistence column on the far right is read and written by every stage that needs durable state.</p>
+
+    <div class="mermaid">
+flowchart TB
+  CLI["<img src='https://cdn.simpleicons.org/typescript/3178c6' width='20'/> vouch CLI<br/><i>Swift, ArgumentParser</i>"]:::cli
+  Map["<img src='https://cdn.simpleicons.org/playwright/2EAD33' width='20'/> Surface Mapper<br/><i>per-platform subprocess</i>"]:::stage
+  Enum["<img src='https://cdn.simpleicons.org/typescript/3178c6' width='20'/> Sequence Enumerator<br/><i>pairwise &middot; exhaustive &middot; sample</i>"]:::stage
+  Oracle["<img src='https://cdn.simpleicons.org/anthropic/D4A373' width='20'/> Oracle Translator<br/><i>Haiku + cache</i>"]:::stage
+  Exec["<img src='https://cdn.simpleicons.org/typescript/3178c6' width='20'/> Executor + Verdict Engine<br/><i>fresh-context workers</i>"]:::stage
+  Induce["<img src='https://cdn.simpleicons.org/typescript/3178c6' width='20'/> Rule Inducer<br/><i>time-weighted scoring</i>"]:::stage
+  Arb["<img src='https://cdn.simpleicons.org/anthropic/D4A373' width='20'/> Clash Arbiter<br/><i>regression vs evolution</i>"]:::stage
+  Rep["<img src='https://cdn.simpleicons.org/typescript/3178c6' width='20'/> Reporter<br/><i>vouch report &middot; rules ls</i>"]:::stage
+  DB[("<img src='https://cdn.simpleicons.org/sqlite/003B57' width='20'/> vouch.db (SQLite)<br/>runs &middot; verdicts &middot; oracle_cache<br/>proposed_rules &middot; rule_history<br/>arbiter_decisions &middot; surface_snapshots")]:::db
+
+  CLI -->|spawns subprocesses| Map
+  Map -->|surface.json| Enum
+  Enum -->|plan.json| Oracle
+  Oracle -->|predicate per action| Exec
+  Exec -->|surface-delta stream| Induce
+  Induce -->|on promoted-rule denial| Arb
+  Arb -.->|finding| Rep
+  Induce -.->|promoted rules| Enum
+
+  Map -.-> DB
+  Enum -.-> DB
+  Oracle -.-> DB
+  Exec -.-> DB
+  Induce -.-> DB
+  Arb -.-> DB
+  Rep -.-> DB
+
+  classDef cli fill:#1e1a36,stroke:#a78bfa,color:#e2e8f0
+  classDef stage fill:#1a2236,stroke:#6366f1,color:#e2e8f0
+  classDef db fill:#1a3636,stroke:#34d399,color:#e2e8f0
+    </div>
+
+    <p class="muted text-sm mt-6 max-w-3xl">The left-side feedback loop is the learning channel: each subsequent <code>vouch plan</code> invocation gets a denser FSM without anyone editing YAML. The right-side dotted arrows are the persistence channel. Arrows are laid out so no edges cross.</p>
+  </div>
+</section>
+
+<!-- Components -->
+<section id="components" class="section-anchor py-20">
+  <div class="max-w-7xl mx-auto px-6">
+    <h2 class="text-4xl font-bold mb-4">The six components</h2>
+    <p class="text-lg muted mb-12 max-w-3xl">Each component does exactly one thing well (Unix philosophy) and exposes a typed boundary another component can mock (Composable). The CLI is the only orchestrator; everything else is a subprocess or a pure module.</p>
+
+    <div class="grid md:grid-cols-2 gap-6">
+
+      <!-- 1. Surface Mapper -->
+      <div class="comp-card">
+        <h3 class="text-xl font-semibold"><img src="https://cdn.simpleicons.org/playwright/2EAD33"/> 1. Surface Mapper</h3>
+        <p class="muted mt-2 text-sm">Per-platform subprocess that walks the System Under Test and emits <code>surface.json</code> &mdash; the set of interactable nodes with stable selectors. Web uses Playwright, iOS uses XCUITest, Android uses Appium 2, Image uses Anthropic vision.</p>
+        <div class="grid grid-cols-2 gap-4 mt-4">
+          <div>
+            <div class="text-xs font-semibold pro mb-1">PROS</div>
+            <ul class="text-xs muted space-y-1">
+              <li>Native introspection per platform; no fragile heuristics</li>
+              <li>Stable selectors prefer <code>data-testid</code> &gt; ARIA role+name &gt; CSS path</li>
+              <li>Single NDJSON contract across all four platforms</li>
+            </ul>
+          </div>
+          <div>
+            <div class="text-xs font-semibold con mb-1">CONS</div>
+            <ul class="text-xs muted space-y-1">
+              <li>Four executor codebases to maintain</li>
+              <li>Image executor's accuracy depends on vision model quality</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <!-- 2. Sequence Enumerator -->
+      <div class="comp-card">
+        <h3 class="text-xl font-semibold"><img src="https://cdn.simpleicons.org/swift/F05138"/> 2. Sequence Enumerator</h3>
+        <p class="muted mt-2 text-sm">Pure function <code>(Surface, PromotedRules, Strategy) &rarr; Plan</code>. Reads promoted rules from <code>vouch.db</code> (empty on a fresh project &mdash; that's the bootstrap case). Emits <code>plan.json</code> with one permutation per row.</p>
+        <div class="grid grid-cols-2 gap-4 mt-4">
+          <div>
+            <div class="text-xs font-semibold pro mb-1">PROS</div>
+            <ul class="text-xs muted space-y-1">
+              <li>Pure function; same inputs &rarr; same outputs (Predictable)</li>
+              <li>Pairwise (PICT covering array) catches most multi-step bugs</li>
+              <li>Exhaustive capped at 100,000 sequences with a clear error past the cap</li>
+            </ul>
+          </div>
+          <div>
+            <div class="text-xs font-semibold con mb-1">CONS</div>
+            <ul class="text-xs muted space-y-1">
+              <li>Pairwise misses some 3-way interactions by design</li>
+              <li>Exhaustive blows up combinatorially past the cap</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <!-- 3. Oracle Translator -->
+      <div class="comp-card">
+        <h3 class="text-xl font-semibold"><img src="https://cdn.simpleicons.org/anthropic/D4A373"/> 3. Oracle Translator</h3>
+        <p class="muted mt-2 text-sm">For each <code>(action, pre-state)</code> pair, calls Claude Haiku 4.5 once to translate <code>spec.md</code> into a <code>PostConditionPredicate</code> from a closed DSL of nine <code>kind</code>s. Cache key includes <code>spec_version</code>, so a spec edit invalidates only the affected rows.</p>
+        <div class="grid grid-cols-2 gap-4 mt-4">
+          <div>
+            <div class="text-xs font-semibold pro mb-1">PROS</div>
+            <ul class="text-xs muted space-y-1">
+              <li>Cheap (Haiku) and capped by the cache</li>
+              <li>Predicate DSL is closed; LLM never emits executable code</li>
+              <li>Spec-section invalidation recomputes only overlapping headings</li>
+            </ul>
+          </div>
+          <div>
+            <div class="text-xs font-semibold con mb-1">CONS</div>
+            <ul class="text-xs muted space-y-1">
+              <li>Ambiguous spec text can produce a wrong-but-plausible predicate</li>
+              <li>Cache stats panel needed to surface this risk to the developer</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <!-- 4. Executor + Verdict Engine -->
+      <div class="comp-card">
+        <h3 class="text-xl font-semibold"><img src="https://cdn.simpleicons.org/swift/F05138"/> 4. Executor + Verdict Engine</h3>
+        <p class="muted mt-2 text-sm">A Swift actor-based worker pool runs permutations against fresh System Under Test instances. Captures pre/post surface snapshots, evaluates the predicate, writes the verdict, emits <code>SurfaceDelta</code> events for the Rule Inducer.</p>
+        <div class="grid grid-cols-2 gap-4 mt-4">
+          <div>
+            <div class="text-xs font-semibold pro mb-1">PROS</div>
+            <ul class="text-xs muted space-y-1">
+              <li>Fresh context per permutation isolates side effects</li>
+              <li>Per-step timeout (30s default); timeout &rarr; verdict, never a hung worker</li>
+              <li>Verdict writes batched per sequence (one transaction)</li>
+            </ul>
+          </div>
+          <div>
+            <div class="text-xs font-semibold con mb-1">CONS</div>
+            <ul class="text-xs muted space-y-1">
+              <li>Boot cost per permutation (browser ~200ms, simulator ~5s)</li>
+              <li>iOS executor mitigates with simulator pooling</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <!-- 5. Rule Inducer -->
+      <div class="comp-card">
+        <h3 class="text-xl font-semibold"><img src="https://cdn.simpleicons.org/swift/F05138"/> 5. Rule Inducer</h3>
+        <p class="muted mt-2 text-sm">The brain. Reads the delta queue, scores candidate rules with a time-weighted Beta-with-decay formula, and promotes or retires under the threshold rule: &ge;10 confirmations, &lt;2 denials, &ge;3 distinct runs, &ge;2 calendar days. The developer never writes a rule; the inducer is the sole writer.</p>
+        <div class="grid grid-cols-2 gap-4 mt-4">
+          <div>
+            <div class="text-xs font-semibold pro mb-1">PROS</div>
+            <ul class="text-xs muted space-y-1">
+              <li>Zero developer setup &mdash; rules emerge from observation</li>
+              <li>Time decay (1/(1+age_days)) means yesterday's denial outweighs last year's confirmation</li>
+              <li>Multi-run, multi-day requirement breaks single-run flukes</li>
+            </ul>
+          </div>
+          <div>
+            <div class="text-xs font-semibold con mb-1">CONS</div>
+            <ul class="text-xs muted space-y-1">
+              <li>Promotion latency: ~2 days minimum for new rules to land</li>
+              <li>Thresholds tunable in <code>vouch.config.yaml</code> when bootstrapping</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <!-- 6. Clash Arbiter -->
+      <div class="comp-card">
+        <h3 class="text-xl font-semibold"><img src="https://cdn.simpleicons.org/anthropic/D4A373"/> 6. Clash Arbiter</h3>
+        <p class="muted mt-2 text-sm">Triggered when a previously promoted rule starts to deny. Loads <code>spec.md</code> at the rule's <code>promoted_at</code> commit (git history first, SQLite fallback), diffs against the current spec, and asks Haiku to classify: <code>regression</code>, <code>evolution_intentional</code>, or <code>evolution_possibly_intentional</code>.</p>
+        <div class="grid grid-cols-2 gap-4 mt-4">
+          <div>
+            <div class="text-xs font-semibold pro mb-1">PROS</div>
+            <ul class="text-xs muted space-y-1">
+              <li>Distinguishes "the code regressed" from "the spec changed and the code followed"</li>
+              <li>Every call audited with prompt sha + raw response + cost in <code>arbiter_decisions</code></li>
+              <li><code>evolution_intentional</code> auto-retires; <code>possibly_intentional</code> flags for review</li>
+            </ul>
+          </div>
+          <div>
+            <div class="text-xs font-semibold con mb-1">CONS</div>
+            <ul class="text-xs muted space-y-1">
+              <li>Will misclassify some regressions as evolution; the audit row is the smoking gun</li>
+              <li>Developer can override with <code>vouch rules arbitrate &lt;rule_id&gt; --as regression</code></li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- Data flow -->
+<section id="dataflow" class="section-anchor py-20" style="background: var(--bg2);">
+  <div class="max-w-7xl mx-auto px-6">
+    <h2 class="text-4xl font-bold mb-4">Data flow: one run, end to end</h2>
+    <p class="text-lg muted mb-12 max-w-3xl">From <code>vouch map</code> to <code>vouch report</code>. Each arrow is one NDJSON message or one SQLite write.</p>
+
+    <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant Dev as Developer
+  participant CLI as vouch CLI
+  participant Map as Surface Mapper
+  participant Enum as Sequence Enumerator
+  participant Oracle as Oracle Translator
+  participant Exec as Executor + Verdict
+  participant Induce as Rule Inducer
+  participant Arb as Clash Arbiter
+  participant DB as vouch.db
+
+  Dev->>CLI: vouch map --target https://app
+  CLI->>Map: spawn subprocess
+  Map->>Map: walk accessibility tree
+  Map->>CLI: surface.json (10 nodes, stable selectors)
+  CLI->>DB: insert run row
+  Dev->>CLI: vouch plan --strategy pairwise
+  CLI->>Enum: surface.json + promoted rules
+  Enum->>CLI: plan.json (N permutations)
+  Dev->>CLI: vouch run --plan plan.json
+  CLI->>Oracle: for each (action, pre-state)
+  Oracle->>DB: cache lookup
+  alt cache hit
+    DB-->>Oracle: predicate
+  else cache miss
+    Oracle->>Oracle: Haiku call
+    Oracle->>DB: cache write
+  end
+  Oracle-->>CLI: predicate per action
+  CLI->>Exec: workers spin up
+  Exec->>Exec: fresh SUT context per permutation
+  Exec->>DB: verdict + surface_snapshot per step
+  Exec->>Induce: SurfaceDelta stream
+  Induce->>Induce: score candidate rules
+  Induce->>DB: proposed_rules + rule_history
+  alt promoted rule starts to deny
+    Induce->>Arb: trigger
+    Arb->>Arb: diff spec.md at promoted_at vs now
+    Arb->>DB: arbiter_decisions (regression / evolution)
+  end
+  Dev->>CLI: vouch report
+  CLI->>DB: read everything
+  CLI-->>Dev: verdicts, findings, rule changes
+    </div>
+  </div>
+</section>
+
+<!-- Decisions -->
+<section id="decisions" class="section-anchor py-20">
+  <div class="max-w-7xl mx-auto px-6">
+    <h2 class="text-4xl font-bold mb-4">Key architectural decisions</h2>
+    <p class="text-lg muted mb-12 max-w-3xl">Sourced from <code>plan.md</code>'s decisions table. Each row is one decision the design depends on; "why" cites the constraint that pinned it.</p>
+
+    <div class="overflow-x-auto">
+      <table class="text-sm">
+        <thead>
+          <tr><th>Decision</th><th>What we chose</th><th>Alternative considered</th><th>Why</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Orchestrator language</td><td>Swift</td><td>Python</td><td>User preference; XCUITest already requires Swift; one less language to context-switch into.</td></tr>
+          <tr><td>Web introspection</td><td>Playwright (TypeScript subprocess)</td><td>Selenium WebDriver from Swift</td><td>Playwright's accessibility-tree API is richer and faster; Selenium-Swift bindings are sparsely maintained.</td></tr>
+          <tr><td>iOS introspection</td><td>XCUITest directly</td><td>Appium iOS driver</td><td>XCUITest is first-party, faster, and avoids the Appium server boot cost when iOS is the only platform.</td></tr>
+          <tr><td>Android introspection</td><td>Appium 2 + UIAutomator2</td><td>Espresso from a Kotlin host</td><td>Appium aligns with the Node helper already running for web; one process to manage instead of two.</td></tr>
+          <tr><td>Subprocess protocol</td><td>NDJSON over stdin/stdout</td><td>gRPC, MessagePack, shared SQLite</td><td>NDJSON is trivially loggable, replayable, and language-agnostic. Parsing per line is irrelevant at our volumes.</td></tr>
+          <tr><td>Async backend</td><td>Long-lived Swift process + SQLite job table</td><td>Redis + BullMQ</td><td>Local-only target. No Redis to install, no daemon to manage.</td></tr>
+          <tr><td>Persistence</td><td>SQLite + dir tree per run</td><td>Postgres</td><td>Local target. SQLite handles tens of thousands of verdicts per run. Postgres is the migration path when hosted.</td></tr>
+          <tr><td>Oracle model</td><td>claude-haiku-4-5-20251001</td><td>Sonnet</td><td>Cost posture. Haiku + cache + closed predicate DSL keeps cost under one cent per hundred unique oracles.</td></tr>
+          <tr><td>Cache key</td><td><code>sha256(action_signature &Vert; pre_state_hash &Vert; spec_version)</code></td><td>Plain action name + URL</td><td>Catches spec-driven invalidation; insensitive to cosmetic URL changes via <code>state_hash</code>.</td></tr>
+          <tr><td>Predicate DSL</td><td>Closed set of 9 <code>kind</code>s</td><td>Free-form JavaScript expression strings</td><td>Security and auditability. The LLM never emits executable code.</td></tr>
+          <tr><td>Sequence strategy default</td><td>Pairwise (covering array, PICT port)</td><td>Exhaustive</td><td>Exhaustive blows up combinatorially. Pairwise catches the majority of multi-step regressions for a fraction of the cost.</td></tr>
+          <tr><td>Rule authorship</td><td>Inducer is the sole writer</td><td>Hybrid (developer declares baseline + inducer adds more)</td><td>Zero setup burden; one source of truth for "where did this rule come from"; inducer already tracks provenance via confirmations/denials.</td></tr>
+          <tr><td>Rule scoring</td><td>Time-weighted (Beta-with-decay)</td><td>Raw confirmation/denial ratio</td><td>A rule that was true last year and started failing yesterday must demote; raw ratios let stale truths dominate.</td></tr>
+          <tr><td>Promotion thresholds</td><td>&ge;10 confirmations, &lt;2 denials, &ge;3 distinct runs, &ge;2 calendar days</td><td>Single confirmation count</td><td>A single noisy run can produce 10 confirmations of the same fluke. Multi-run, multi-day forces independence.</td></tr>
+          <tr><td>Arbiter LLM model</td><td>Same Haiku, separate cache</td><td>Sonnet for arbiter</td><td>One cost posture across the system. Arbiter prompt is short (narrowed diff + rule). Sonnet escalation is a config flag.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- Trade-offs -->
+<section id="tradeoffs" class="section-anchor py-20" style="background: var(--bg2);">
+  <div class="max-w-7xl mx-auto px-6">
+    <h2 class="text-4xl font-bold mb-4">Honest trade-offs</h2>
+    <p class="text-lg muted mb-12 max-w-3xl">Every panel below is something the design accepts as a cost, with the trigger that would justify revisiting.</p>
+
+    <div class="grid md:grid-cols-2 gap-6">
+
+      <div class="panel p-6">
+        <h3 class="text-lg font-semibold mb-2">Local-only v1 vs. hosted from day one</h3>
+        <p class="text-sm muted mb-3">Non-developer team members cannot trigger runs themselves.</p>
+        <div class="text-xs"><span class="con font-semibold">When it would bite:</span> <span class="muted">a designer wants to QA their changes without a terminal.</span></div>
+        <div class="text-xs mt-2"><span class="pro font-semibold">Trigger to revisit:</span> <span class="muted">when more than one non-developer asks.</span></div>
+      </div>
+
+      <div class="panel p-6">
+        <h3 class="text-lg font-semibold mb-2">LLM-inferred oracles vs. hand-written</h3>
+        <p class="text-sm muted mb-3">Some oracle errors (<code>unparseable_oracle</code> verdict, miscalibrated predicate).</p>
+        <div class="text-xs"><span class="con font-semibold">When it would bite:</span> <span class="muted">spec is ambiguous and the model invents a predicate the developer disagrees with.</span></div>
+        <div class="text-xs mt-2"><span class="pro font-semibold">Mitigation:</span> <span class="muted"><code>vouch cache stats</code> exposes the Large Language Model's effective contribution; developer can override any predicate by editing the cache row.</span></div>
+      </div>
+
+      <div class="panel p-6">
+        <h3 class="text-lg font-semibold mb-2">SQLite vs. Postgres</h3>
+        <p class="text-sm muted mb-3">Worker count bounded by SQLite's writer-serialization.</p>
+        <div class="text-xs"><span class="con font-semibold">When it would bite:</span> <span class="muted">above 16 concurrent workers writing verdicts.</span></div>
+        <div class="text-xs mt-2"><span class="pro font-semibold">Mitigation:</span> <span class="muted">executor batches verdict writes per sequence (one transaction per sequence). Bottleneck is sequence count, not step count.</span></div>
+      </div>
+
+      <div class="panel p-6">
+        <h3 class="text-lg font-semibold mb-2">Per-permutation fresh System Under Test vs. reusing</h3>
+        <p class="text-sm muted mb-3">Boot cost: browser ~200ms, simulator ~5s, app launch ~1s.</p>
+        <div class="text-xs"><span class="con font-semibold">When it would bite:</span> <span class="muted">100 iOS permutations is several minutes of simulator boot.</span></div>
+        <div class="text-xs mt-2"><span class="pro font-semibold">Mitigation:</span> <span class="muted">iOS executor pools simulators (one simulator serves N permutations sequentially with app reset between each).</span></div>
+      </div>
+
+      <div class="panel p-6">
+        <h3 class="text-lg font-semibold mb-2">Pairwise default vs. exhaustive default</h3>
+        <p class="text-sm muted mb-3">Misses some 3-way interactions in the default mode.</p>
+        <div class="text-xs"><span class="con font-semibold">When it would bite:</span> <span class="muted">a regression that requires three specific actions in a specific order.</span></div>
+        <div class="text-xs mt-2"><span class="pro font-semibold">Mitigation:</span> <span class="muted"><code>--strategy exhaustive --depth 3</code> is one flag away; the developer chooses when paranoia is required.</span></div>
+      </div>
+
+      <div class="panel p-6">
+        <h3 class="text-lg font-semibold mb-2">Statistical confidence vs. promotion latency</h3>
+        <p class="text-sm muted mb-3">Higher thresholds (10 / 3 / 2) mean rules promote slowly but stay correct.</p>
+        <div class="text-xs"><span class="con font-semibold">When it would bite:</span> <span class="muted">developer iterating on a brand-new feature wants the inducer to recognize a pattern within a day.</span></div>
+        <div class="text-xs mt-2"><span class="pro font-semibold">Mitigation:</span> <span class="muted">per-project tuning in <code>vouch.config.yaml</code>; drop to 3/2/0 while bootstrapping, raise back later.</span></div>
+      </div>
+
+      <div class="panel p-6">
+        <h3 class="text-lg font-semibold mb-2">Auto-retire vs. always flag-for-human</h3>
+        <p class="text-sm muted mb-3">Auto-retire self-heals; the cost is occasional silently-wrong retirement. We split: <code>evolution_intentional</code> retires, <code>evolution_possibly_intentional</code> flags.</p>
+        <div class="text-xs"><span class="con font-semibold">When it would bite:</span> <span class="muted">arbiter is overconfident and a rule retires that should not have.</span></div>
+        <div class="text-xs mt-2"><span class="pro font-semibold">Mitigation:</span> <span class="muted"><code>vouch rules ls --status retired_by_spec_change</code> is greppable; <code>arbiter_decisions</code> audit row is the smoking gun.</span></div>
+      </div>
+
+      <div class="panel p-6">
+        <h3 class="text-lg font-semibold mb-2">Spec-diff arbitration vs. test-author judgement</h3>
+        <p class="text-sm muted mb-3">A Large Language Model reading a diff will sometimes misclassify regression as evolution or vice versa.</p>
+        <div class="text-xs"><span class="con font-semibold">When it would bite:</span> <span class="muted">arbiter labels a real regression <code>evolution_intentional</code> because the spec edit is superficially plausible.</span></div>
+        <div class="text-xs mt-2"><span class="pro font-semibold">Mitigation:</span> <span class="muted">every arbiter call audited with prompt + raw response; developer can replay, override with <code>vouch rules arbitrate &lt;rule_id&gt; --as regression</code>, and the override itself is logged.</span></div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- Cost -->
+<section id="cost" class="section-anchor py-20">
+  <div class="max-w-7xl mx-auto px-6">
+    <h2 class="text-4xl font-bold mb-4">Cost model</h2>
+    <p class="text-lg muted mb-12 max-w-3xl">Vouch makes two Large Language Model calls per unique <code>(action, pre-state)</code>: one Haiku call by the Oracle Translator, and (only on a clash) one Haiku call by the Arbiter. Everything else is deterministic. The cache absorbs repeated invocations across runs of the same plan.</p>
+
+    <div class="grid md:grid-cols-2 gap-6">
+      <div class="panel p-6">
+        <h3 class="text-lg font-semibold mb-3">Per-run LLM cost (estimated, first run, cold cache)</h3>
+        <canvas id="costChart" height="220"></canvas>
+        <p class="text-xs muted mt-3">Estimate assumes: 50 unique actions, 5 unique pre-states per action, 100% cache miss on cold start. Numbers in dollars at published Haiku 4.5 pricing. Once the cache warms, the cost on the second run of the same plan is ~0 (predicates are deterministic per <code>(action, pre-state, spec_version)</code>).</p>
+      </div>
+
+      <div class="panel p-6">
+        <h3 class="text-lg font-semibold mb-3">Cache-hit ratio over successive runs (target)</h3>
+        <canvas id="cacheChart" height="220"></canvas>
+        <p class="text-xs muted mt-3">After the first run, unchanged <code>(action, pre-state)</code> pairs hit the cache. The dip on run 4 reflects a hypothetical spec edit invalidating overlapping headings. Spec-section invalidation means a small edit doesn't blow away the whole cache.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Slicing -->
+<section id="slices" class="section-anchor py-20" style="background: var(--bg2);">
+  <div class="max-w-7xl mx-auto px-6">
+    <h2 class="text-4xl font-bold mb-4">Slice sequencing</h2>
+    <p class="text-lg muted mb-12 max-w-3xl">Thirteen slices. Each ships independently; the QA gate can replay any of them. Slice 1 is next.</p>
+
+    <div class="grid md:grid-cols-3 gap-4">
+      <div class="panel p-4"><div class="badge badge-warn mb-2">Next</div><div class="font-semibold">Slice 1 &mdash; CLI scaffold + NDJSON protocol</div><div class="text-xs muted mt-1"><code>vouch --version</code>, <code>vouch doctor</code>, protocol types defined.</div></div>
+      <div class="panel p-4 opacity-70"><div class="font-semibold">Slice 2 &mdash; Web Surface Mapper</div><div class="text-xs muted mt-1">Playwright subprocess, fixture SPA, <code>surface.json</code>.</div></div>
+      <div class="panel p-4 opacity-70"><div class="font-semibold">Slice 3 &mdash; Sequence Enumerator</div><div class="text-xs muted mt-1">Pairwise + exhaustive + sample strategies.</div></div>
+      <div class="panel p-4 opacity-70"><div class="font-semibold">Slice 4 &mdash; Oracle Translator + cache</div><div class="text-xs muted mt-1">Haiku integration, predicate DSL, spec-section invalidation.</div></div>
+      <div class="panel p-4 opacity-70"><div class="font-semibold">Slice 5 &mdash; Executor + Verdict (web)</div><div class="text-xs muted mt-1">Worker pool, fresh-context isolation, delta emission.</div></div>
+      <div class="panel p-4 opacity-70"><div class="font-semibold">Slice 6 &mdash; Rule Inducer</div><div class="text-xs muted mt-1">Time-weighted scoring, promotion + demotion thresholds.</div></div>
+      <div class="panel p-4 opacity-70"><div class="font-semibold">Slice 7 &mdash; Clash Arbiter</div><div class="text-xs muted mt-1">Git-history spec loader, Haiku classification, audit trail.</div></div>
+      <div class="panel p-4 opacity-70"><div class="font-semibold">Slice 8 &mdash; Reporter polish</div><div class="text-xs muted mt-1"><code>vouch report</code>, <code>vouch status</code>, <code>vouch cache stats</code>.</div></div>
+      <div class="panel p-4 opacity-70"><div class="font-semibold">Slice 9 &mdash; iOS executor</div><div class="text-xs muted mt-1">XCUITest helper; induction works unchanged.</div></div>
+      <div class="panel p-4 opacity-70"><div class="font-semibold">Slice 10 &mdash; Android executor</div><div class="text-xs muted mt-1">Appium 2 + UIAutomator2.</div></div>
+      <div class="panel p-4 opacity-70"><div class="font-semibold">Slice 11 &mdash; Image executor</div><div class="text-xs muted mt-1">Vision-LLM fallback for screenshot handoff.</div></div>
+      <div class="panel p-4 opacity-70"><div class="font-semibold">Slice 12 &mdash; Self-host (Vouch tests Vouch)</div><div class="text-xs muted mt-1">HTTP shim around the CLI for the web executor to point at.</div></div>
+      <div class="panel p-4 opacity-70 md:col-span-3"><div class="font-semibold">Slice 13 &mdash; Architecture website + AI interview prep + defense breakout script</div><div class="text-xs muted mt-1">Downstream deliverables once architecture is stable. <span class="good">(This page is the first half of Slice 13, shipped early.)</span></div></div>
+    </div>
+  </div>
+</section>
+
+<!-- Stack -->
+<section id="stack" class="section-anchor py-20">
+  <div class="max-w-7xl mx-auto px-6">
+    <h2 class="text-4xl font-bold mb-4">Tech stack</h2>
+    <p class="text-lg muted mb-12 max-w-3xl">Pinned in <code>constitution.md</code>. Switching any of these requires amending the constitution first.</p>
+
+    <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+      <div class="stack-card"><img src="https://cdn.simpleicons.org/typescript/3178c6"/><div><div class="font-semibold">TypeScript 5.7</div><div class="text-xs muted">All code: CLI, core, executor, dashboard</div></div></div>
+      <div class="stack-card"><img src="https://cdn.simpleicons.org/nodedotjs/339933"/><div><div class="font-semibold">Node.js 20+</div><div class="text-xs muted">Runtime</div></div></div>
+      <div class="stack-card"><img src="https://cdn.simpleicons.org/playwright/2EAD33"/><div><div class="font-semibold">Playwright</div><div class="text-xs muted">Surface mapping + executor (web; iOS/Android land later via Playwright + Appium)</div></div></div>
+      <div class="stack-card"><img src="https://cdn.simpleicons.org/sqlite/003B57"/><div><div class="font-semibold">SQLite (better-sqlite3)</div><div class="text-xs muted"><code>vouch.db</code>: projects, runs, actions, permutations, predictions, executions</div></div></div>
+      <div class="stack-card"><img src="https://cdn.simpleicons.org/anthropic/D4A373"/><div><div class="font-semibold">Anthropic Claude</div><div class="text-xs muted">Haiku 4.5 (oracle, with deterministic heuristic fallback)</div></div></div>
+      <div class="stack-card"><img src="https://cdn.simpleicons.org/express/e8e0cc"/><div><div class="font-semibold">Express 4</div><div class="text-xs muted">Dashboard server (JSON API + static UI)</div></div></div>
+      <div class="stack-card"><img src="https://cdn.simpleicons.org/zod/3068b7"/><div><div class="font-semibold">Zod 3</div><div class="text-xs muted">Single source of truth for every cross-module shape</div></div></div>
+      <div class="stack-card"><img src="https://cdn.simpleicons.org/vitest/6e9f18"/><div><div class="font-semibold">Vitest</div><div class="text-xs muted">Property + unit tests</div></div></div>
+      <div class="stack-card"><img src="https://cdn.simpleicons.org/github/f2efe6"/><div><div class="font-semibold">GitHub</div><div class="text-xs muted">Primary remote (CI, code review)</div></div></div>
+      <div class="stack-card"><img src="https://cdn.simpleicons.org/gitlab/fc6d26"/><div><div class="font-semibold">GitLab</div><div class="text-xs muted">Gauntlet mirror (dual-push)</div></div></div>
+      <div class="stack-card"><img src="https://cdn.simpleicons.org/tailwindcss/06b6d4"/><div><div class="font-semibold">Tailwind</div><div class="text-xs muted">Dashboard UI (CDN, no build step)</div></div></div>
+      <div class="stack-card"><img src="https://cdn.simpleicons.org/anthropic/D4A373"/><div><div class="font-semibold">@anthropic-ai/sdk</div><div class="text-xs muted">First-party TS client</div></div></div>
+    </div>
+  </div>
+</section>
+
+<!-- Footer -->
+<footer class="py-12" style="background: var(--bg2); border-top: 1px solid var(--border);">
+  <div class="max-w-7xl mx-auto px-6">
+    <div class="flex flex-wrap justify-between items-start gap-6">
+      <div>
+        <div class="flex items-center gap-3 mb-3">
+          <div class="w-8 h-8 rounded-lg flex items-center justify-center font-bold text-white" style="background: linear-gradient(135deg, #6366f1 0%, #34d399 100%);">V</div>
+          <span class="font-bold text-lg">Vouch</span>
+        </div>
+        <p class="text-sm muted max-w-md">Agentic Model-Based Testing. The developer never authors a transition rule.</p>
+      </div>
+      <div class="flex flex-col gap-2 text-sm">
+        <a href="runs.html" class="nav-link">View runs &rarr;</a>
+        <a href="https://github.com/scott-lydon/vouch" class="nav-link">GitHub</a>
+        <a href="https://labs.gauntletai.com/scottlydon/vouch" class="nav-link">GitLab</a>
+        <a href="https://github.com/scott-lydon/vouch/blob/main/constitution.md" class="nav-link">constitution.md</a>
+        <a href="https://github.com/scott-lydon/vouch/blob/main/spec.md" class="nav-link">spec.md</a>
+        <a href="https://github.com/scott-lydon/vouch/blob/main/plan.md" class="nav-link">plan.md</a>
+        <a href="https://github.com/scott-lydon/vouch/blob/main/tasks.md" class="nav-link">tasks.md</a>
+      </div>
+    </div>
+    <div class="text-xs muted mt-8">This page is sourced from <code>constitution.md</code>, <code>spec.md</code>, <code>plan.md</code>, and <code>tasks.md</code>. If any panel disagrees with the source docs, the source docs win and this page is stale.</div>
+  </div>
+</footer>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'dark',
+    securityLevel: 'loose',
+    themeVariables: {
+      darkMode: true,
+      background: '#1a2236',
+      primaryColor: '#1a2236',
+      primaryTextColor: '#e2e8f0',
+      primaryBorderColor: '#6366f1',
+      lineColor: '#94a3b8',
+      secondaryColor: '#232d44',
+      tertiaryColor: '#0a0e1a',
+      fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif'
+    }
+  });
+
+  // Cost chart: per-run LLM cost, cold cache vs warm cache
+  new Chart(document.getElementById('costChart'), {
+    type: 'bar',
+    data: {
+      labels: ['Oracle (cold cache)', 'Arbiter (only on clash)', 'Run 2 (warm cache)', 'Run 3 (warm cache)'],
+      datasets: [{
+        label: 'Estimated cost (USD)',
+        data: [0.025, 0.002, 0.0, 0.0],
+        backgroundColor: ['#6366f1', '#a78bfa', '#34d399', '#34d399'],
+        borderColor: '#6366f1',
+        borderWidth: 0
+      }]
+    },
+    options: {
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: '#94a3b8' }, grid: { color: '#2d3a55' } },
+        y: { ticks: { color: '#94a3b8', callback: v => '$' + v.toFixed(3) }, grid: { color: '#2d3a55' } }
+      }
+    }
+  });
+
+  // Cache-hit ratio chart
+  new Chart(document.getElementById('cacheChart'), {
+    type: 'line',
+    data: {
+      labels: ['Run 1 (cold)', 'Run 2', 'Run 3', 'Run 4 (spec edit)', 'Run 5'],
+      datasets: [{
+        label: 'Cache hit ratio',
+        data: [0, 0.98, 0.99, 0.65, 0.97],
+        borderColor: '#34d399',
+        backgroundColor: 'rgba(52,211,153,0.12)',
+        tension: 0.3,
+        fill: true,
+        pointBackgroundColor: '#34d399'
+      }]
+    },
+    options: {
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: '#94a3b8' }, grid: { color: '#2d3a55' } },
+        y: { ticks: { color: '#94a3b8', callback: v => Math.round(v*100) + '%' }, grid: { color: '#2d3a55' }, min: 0, max: 1 }
+      }
+    }
+  });
+</script>
+
+</body>
+</html>

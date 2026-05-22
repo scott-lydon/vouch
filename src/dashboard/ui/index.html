@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Vouch — Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body class="min-h-screen">
+
+<nav class="sticky top-0 z-50 backdrop-blur-md" style="background: rgba(10, 14, 26, 0.85); border-bottom: 1px solid var(--border);">
+  <div class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
+    <a href="#/" class="flex items-center gap-3">
+      <div class="w-8 h-8 rounded-lg flex items-center justify-center font-bold text-white" style="background: linear-gradient(135deg, #6366f1 0%, #34d399 100%);">V</div>
+      <span class="font-bold text-lg">Vouch</span>
+      <span class="badge badge-good">v0.1</span>
+    </a>
+    <div class="text-sm muted">
+      <span id="breadcrumb"></span>
+    </div>
+  </div>
+</nav>
+
+<main id="app" class="max-w-7xl mx-auto px-6 py-10">
+  <div class="muted">Loading…</div>
+</main>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

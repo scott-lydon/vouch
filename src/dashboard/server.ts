@@ -1,0 +1,111 @@
+// Vouch dashboard server.
+//
+// Single Express process. Serves:
+//   - JSON API at /api/* for the client-side renderer
+//   - Static HTML/JS/CSS from ./ui at /
+//
+// The dashboard is intentionally read-mostly. The only write endpoint is
+// POST /api/predictions/:permutationId/note, which persists the operator's
+// edited "expected behavior" note. That endpoint is idempotent and never
+// overwrites the model's prediction itself (those are upserted only by the
+// oracle pass).
+
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import express from "express";
+
+import {
+  getExecution,
+  getPrediction,
+  getProject,
+  getRun,
+  listActionsForRun,
+  listPermutationsForRun,
+  listProjects,
+  listRunsForProject,
+  openDB,
+  updatePredictionNote,
+} from "../core/db.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const UI_DIR = resolve(__dirname, "ui");
+
+export async function startServer(dbPath: string, port: number): Promise<void> {
+  const db = openDB(dbPath);
+  const app = express();
+  app.use(express.json({ limit: "256kb" }));
+  app.use(express.static(UI_DIR));
+
+  // ---- read endpoints ----
+
+  app.get("/api/projects", (_req, res) => {
+    const projects = listProjects(db);
+    res.json({ projects });
+  });
+
+  app.get("/api/projects/:projectId/runs", (req, res) => {
+    const project = getProject(db, req.params.projectId);
+    if (!project) {
+      res.status(404).json({ error: `project '${req.params.projectId}' not found` });
+      return;
+    }
+    const runs = listRunsForProject(db, project.id);
+    res.json({ project, runs });
+  });
+
+  app.get("/api/runs/:runId", (req, res) => {
+    const run = getRun(db, req.params.runId);
+    if (!run) {
+      res.status(404).json({ error: `run '${req.params.runId}' not found` });
+      return;
+    }
+    const project = getProject(db, run.project_id);
+    const actions = listActionsForRun(db, run.id);
+    const perms = listPermutationsForRun(db, run.id);
+    const enriched = perms.map((p) => {
+      const prediction = getPrediction(db, p.id);
+      const execution = getExecution(db, p.id);
+      return {
+        permutation: p,
+        prediction,
+        execution,
+        action_descriptions: p.action_ids.map((id) => {
+          const a = actions.find((x) => x.id === id);
+          return a ? { id: a.id, kind: a.kind, description: a.description, selector: a.selector } : null;
+        }),
+      };
+    });
+    res.json({ run, project, actions, permutations: enriched });
+  });
+
+  // ---- write endpoint ----
+
+  app.post("/api/predictions/:permutationId/note", (req, res) => {
+    const noteText = String((req.body?.note_text ?? "")).trim();
+    if (noteText.length > 4_000) {
+      res.status(400).json({ error: `note_text too long (max 4000 chars, got ${noteText.length})` });
+      return;
+    }
+    try {
+      updatePredictionNote(db, req.params.permutationId, noteText, new Date().toISOString());
+      const updated = getPrediction(db, req.params.permutationId);
+      res.json({ ok: true, prediction: updated });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  // ---- SPA fallback: every non-API path returns index.html so the client
+  // router (vanilla JS) handles routes.
+  app.get(/^(?!\/api).*/, (_req, res) => {
+    res.sendFile(resolve(UI_DIR, "index.html"));
+  });
+
+  await new Promise<void>((resolve) => {
+    app.listen(port, () => {
+      process.stdout.write(`vouch dashboard running at http://localhost:${port}\n`);
+      resolve();
+    });
+  });
+}

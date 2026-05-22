@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Vouch — Runs viewer</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #0a0e1a; --bg2: #121826; --panel: #1a2236; --panel2: #232d44;
+    --accent: #6366f1; --accent2: #818cf8;
+    --good: #34d399; --warn: #fbbf24; --bad: #f87171;
+    --text: #e2e8f0; --muted: #94a3b8; --border: #2d3a55;
+  }
+  html, body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; }
+  .accent-text { color: var(--accent2); }
+  .good { color: var(--good); } .warn { color: var(--warn); } .bad { color: var(--bad); } .muted { color: var(--muted); }
+  code { background: var(--panel2); padding: 2px 8px; border-radius: 4px; font-family: "JetBrains Mono", Menlo, Monaco, Consolas, monospace; font-size: 0.9em; }
+  pre { background: var(--panel2); padding: 16px; border-radius: 8px; overflow-x: auto; border: 1px solid var(--border); }
+  pre code { background: transparent; padding: 0; }
+  .nav-link { color: var(--muted); transition: color 0.15s; }
+  .nav-link:hover { color: var(--accent2); }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 0.75rem; font-weight: 600; }
+  .badge-good { background: rgba(52, 211, 153, 0.15); color: var(--good); border: 1px solid rgba(52, 211, 153, 0.3); }
+  .badge-warn { background: rgba(251, 191, 36, 0.15); color: var(--warn); border: 1px solid rgba(251, 191, 36, 0.3); }
+  .badge-bad { background: rgba(248, 113, 113, 0.15); color: var(--bad); border: 1px solid rgba(248, 113, 113, 0.3); }
+  .badge-accent { background: rgba(99, 102, 241, 0.15); color: var(--accent2); border: 1px solid rgba(99, 102, 241, 0.3); }
+  .schema { background: var(--panel2); border-left: 3px solid var(--accent); border-radius: 6px; padding: 12px 16px; }
+  .mermaid { background: var(--panel); border-radius: 12px; padding: 24px; border: 1px solid var(--border); }
+  .timeline { position: relative; padding-left: 32px; }
+  .timeline::before { content: ""; position: absolute; left: 12px; top: 0; bottom: 0; width: 2px; background: var(--border); }
+  .timeline-item { position: relative; padding-bottom: 24px; }
+  .timeline-item::before { content: ""; position: absolute; left: -26px; top: 6px; width: 12px; height: 12px; border-radius: 50%; background: var(--panel); border: 2px solid var(--accent); }
+  .timeline-item.pass::before { border-color: var(--good); }
+  .timeline-item.fail::before { border-color: var(--bad); }
+  .timeline-item.skip::before { border-color: var(--warn); }
+  .gradient-text { background: linear-gradient(135deg, #818cf8 0%, #34d399 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+  .grid-pattern { background-image: linear-gradient(rgba(99, 102, 241, 0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(99, 102, 241, 0.05) 1px, transparent 1px); background-size: 24px 24px; }
+  .empty-illustration { font-size: 88px; opacity: 0.25; line-height: 1; }
+</style>
+</head>
+<body class="min-h-screen">
+
+<!-- Sticky nav (same as index.html) -->
+<nav class="sticky top-0 z-50 backdrop-blur-md" style="background: rgba(10, 14, 26, 0.85); border-bottom: 1px solid var(--border);">
+  <div class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <a href="index.html" class="flex items-center gap-3">
+        <div class="w-8 h-8 rounded-lg flex items-center justify-center font-bold text-white" style="background: linear-gradient(135deg, #6366f1 0%, #34d399 100%);">V</div>
+        <span class="font-bold text-lg">Vouch</span>
+      </a>
+      <span class="badge badge-warn">pre-bootstrap</span>
+    </div>
+    <div class="hidden md:flex gap-6 text-sm">
+      <a href="index.html" class="nav-link">&larr; Architecture</a>
+      <a href="#empty" class="nav-link" style="color: var(--accent2);">Runs</a>
+      <a href="#schema" class="nav-link">Schema</a>
+      <a href="#wiring" class="nav-link">How this page reads data</a>
+    </div>
+  </div>
+</nav>
+
+<header class="grid-pattern">
+  <div class="max-w-7xl mx-auto px-6 py-16">
+    <h1 class="text-5xl font-bold mb-3"><span class="gradient-text">Runs</span></h1>
+    <p class="text-lg muted max-w-3xl">Every time you run <code>vouch run</code>, this page shows you what happened: which permutations executed against which surface, what each verdict was, which candidate rules the inducer scored, and any clash arbitration findings.</p>
+  </div>
+</header>
+
+<!-- Live state: dashboard exists, point operators there. -->
+<section id="empty" class="py-12">
+  <div class="max-w-7xl mx-auto px-6">
+    <div class="panel p-10 text-center" style="border-color: var(--good);">
+      <div class="empty-illustration mb-4" style="opacity: 0.4; color: var(--good);">&check;</div>
+      <h2 class="text-2xl font-semibold mb-3">Vouch is live. The dashboard runs locally.</h2>
+      <p class="muted max-w-2xl mx-auto mb-6">As of 2026-05-22 Vouch ships an end-to-end pipeline. The fixture form in this repo has been mapped (9 actions), planned (51 permutations at depth 2 with rule filtering for type-after-focus), oracle-predicted (heuristic until you set <code>ANTHROPIC_API_KEY</code>, then Haiku), and executed (all 51 pass on the fixture). Real data is in <code>vouch.db</code>; the dashboard renders it with editable operator notes.</p>
+      <p class="muted max-w-2xl mx-auto mb-6">Two terminal commands to view your runs:</p>
+      <pre style="text-align: left; max-width: 600px; margin: 0 auto;"><code>cd ~/Desktop/Clutter/iOS/vouch
+npx tsx src/cli.ts serve   # then open http://localhost:7321/</code></pre>
+      <div class="flex justify-center gap-3 flex-wrap mt-6">
+        <a href="http://localhost:7321/" class="px-5 py-2.5 rounded-lg font-medium" style="background: var(--accent); color: white;">Open live dashboard &rarr;</a>
+        <a href="#schema" class="px-5 py-2.5 rounded-lg font-medium border" style="border-color: var(--border); color: var(--text);">Schema reference (this page)</a>
+        <a href="index.html" class="px-5 py-2.5 rounded-lg font-medium border" style="border-color: var(--border); color: var(--text);">&larr; Architecture</a>
+      </div>
+    </div>
+
+    <!-- Current readiness checklist (honest, derived from tasks.md slice 5 dependencies) -->
+    <div class="panel p-6 mt-8">
+      <h3 class="text-lg font-semibold mb-4">What needs to ship before this page populates</h3>
+      <ul class="space-y-3 text-sm">
+        <li class="flex gap-3"><span class="badge badge-bad" style="min-width: 56px; text-align: center;">pending</span><div><span class="font-semibold">Slice 1</span> &mdash; CLI scaffold + NDJSON protocol skeleton <span class="muted">(<code>vouch --version</code>, <code>vouch doctor</code>)</span></div></li>
+        <li class="flex gap-3"><span class="badge badge-bad" style="min-width: 56px; text-align: center;">pending</span><div><span class="font-semibold">Slice 2</span> &mdash; Web Surface Mapper <span class="muted">(produces <code>surface.json</code>)</span></div></li>
+        <li class="flex gap-3"><span class="badge badge-bad" style="min-width: 56px; text-align: center;">pending</span><div><span class="font-semibold">Slice 3</span> &mdash; Sequence Enumerator <span class="muted">(produces <code>plan.json</code>)</span></div></li>
+        <li class="flex gap-3"><span class="badge badge-bad" style="min-width: 56px; text-align: center;">pending</span><div><span class="font-semibold">Slice 4</span> &mdash; Oracle Translator + cache <span class="muted">(produces <code>predicate</code> per action)</span></div></li>
+        <li class="flex gap-3"><span class="badge badge-accent" style="min-width: 56px; text-align: center;">unblocks</span><div><span class="font-semibold">Slice 5</span> &mdash; Executor + Verdict Engine <span class="muted">(first <code>vouch run</code> &rarr; this page populates)</span></div></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- Schema preview -->
+<section id="schema" class="py-12" style="background: var(--bg2);">
+  <div class="max-w-7xl mx-auto px-6">
+    <h2 class="text-3xl font-bold mb-4">Run schema preview</h2>
+    <p class="muted mb-8 max-w-3xl">When a run lands at <code>./runs/&lt;run-id&gt;/</code>, this page reads its <code>index.json</code> and renders the panels below. The shape is sourced from <code>plan.md</code> &sect;3 (Surface Mapper) and the SQLite schemas in <code>plan.md</code>'s persistence layer. Treat the layout below as documentation of what each panel will show, not as data &mdash; nothing here is a real measurement.</p>
+
+    <!-- Schema 1: run header -->
+    <div class="panel p-6 mb-6">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="text-lg font-semibold">1. Run header (per <code>runs.row</code> in <code>vouch.db</code>)</h3>
+        <span class="badge badge-warn">schema, not data</span>
+      </div>
+      <p class="muted text-sm mb-4">Top of each run page: identity + summary verdict counts. Real values come from a single SQL read on <code>SELECT * FROM runs WHERE id = ?</code>.</p>
+      <div class="schema">
+<pre><code>{
+  "run_id":          "run_2026-05-22T12-34-56Z_a1b2c3",
+  "started_at":      "2026-05-22T12:34:56Z",
+  "ended_at":        "2026-05-22T12:36:12Z",
+  "platform":        "web",
+  "target":          "http://localhost:3000",
+  "spec_version":    "sha256:a4b1...",     // from spec.md at run-time
+  "strategy":        "pairwise",
+  "depth":           3,
+  "permutations":    47,
+  "verdicts": {
+    "pass":          39,
+    "fail":           3,
+    "timeout":        2,
+    "missing_input":  2,
+    "infrastructure_error": 1,
+    "unparseable_oracle":   0
+  },
+  "rule_changes": {
+    "candidates_created":   12,
+    "promoted":              0,
+    "demoted":               0,
+    "retired_by_spec_change": 0
+  },
+  "arbiter_findings":      0,
+  "cost_usd":              0.0234
+}</code></pre>
+      </div>
+    </div>
+
+    <!-- Schema 2: timeline -->
+    <div class="panel p-6 mb-6">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="text-lg font-semibold">2. Permutation timeline (per <code>verdicts</code> rows)</h3>
+        <span class="badge badge-warn">schema, not data</span>
+      </div>
+      <p class="muted text-sm mb-4">One row per permutation, ordered chronologically. Click a row to expand its surface delta, predicate, and oracle reasoning. Layout shown below; real entries come from <code>SELECT * FROM verdicts WHERE run_id = ? ORDER BY started_at</code>.</p>
+
+      <div class="timeline">
+        <div class="timeline-item pass">
+          <div class="text-sm muted">12:34:58.412</div>
+          <div class="font-semibold">perm-001 &mdash; Click "Sign in" then enter valid email</div>
+          <div class="text-xs muted mt-1">Predicate: <code>navigated_to("/dashboard") AND text_visible("Welcome")</code> &mdash; <span class="good">PASS</span></div>
+        </div>
+        <div class="timeline-item pass">
+          <div class="text-sm muted">12:35:01.117</div>
+          <div class="font-semibold">perm-002 &mdash; Click "Sign in" then enter empty email</div>
+          <div class="text-xs muted mt-1">Predicate: <code>text_visible("Email required") AND NOT navigated</code> &mdash; <span class="good">PASS</span></div>
+        </div>
+        <div class="timeline-item fail">
+          <div class="text-sm muted">12:35:04.290</div>
+          <div class="font-semibold">perm-003 &mdash; Click "Sign in" then enter email with leading whitespace</div>
+          <div class="text-xs muted mt-1">Predicate: <code>navigated_to("/dashboard") OR text_visible("Email invalid")</code> &mdash; <span class="bad">FAIL</span> &mdash; observed: empty page, no error toast</div>
+        </div>
+        <div class="timeline-item skip">
+          <div class="text-sm muted">12:35:06.844</div>
+          <div class="font-semibold">perm-004 &mdash; Open settings, change name field</div>
+          <div class="text-xs muted mt-1">Predicate: <code>text_visible("Settings saved")</code> &mdash; <span class="warn">TIMEOUT</span> at 30s (default per-step)</div>
+        </div>
+      </div>
+      <p class="muted text-xs mt-3"><em>The four rows above are layout placeholders illustrating what the timeline component will render. They are not from a real run; Vouch has no runs yet.</em></p>
+    </div>
+
+    <!-- Schema 3: FSM diff -->
+    <div class="panel p-6 mb-6">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="text-lg font-semibold">3. FSM &amp; rule changes (per <code>proposed_rules</code> + <code>rule_history</code>)</h3>
+        <span class="badge badge-warn">schema, not data</span>
+      </div>
+      <p class="muted text-sm mb-4">Side-by-side diff of the rule set before and after the run. Promotion needs &ge;10 confirmations across &ge;3 distinct runs and &ge;2 calendar days, so most early runs show "candidates created" but zero "promoted." The shape:</p>
+      <div class="schema">
+<pre><code>{
+  "candidates_created": [
+    {
+      "rule_id":         "rule_a1b2",
+      "shape":           "precondition_action_postcondition",
+      "precondition":    "page_state == 'logged_out'",
+      "action":          "click('Sign in')",
+      "postcondition":   "navigated_to('/login')",
+      "confirmations":    1,
+      "denials":          0,
+      "first_observed":  "2026-05-22T12:34:58Z"
+    }
+  ],
+  "promoted":   [],
+  "demoted":    [],
+  "retired_by_spec_change": []
+}</code></pre>
+      </div>
+    </div>
+
+    <!-- Schema 4: arbitration -->
+    <div class="panel p-6 mb-6">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="text-lg font-semibold">4. Clash arbitration findings (per <code>arbiter_decisions</code>)</h3>
+        <span class="badge badge-warn">schema, not data</span>
+      </div>
+      <p class="muted text-sm mb-4">Only present when a previously-promoted rule starts to deny during this run. The arbiter compares <code>spec.md</code> at <code>promoted_at</code> against the current <code>spec.md</code> and classifies the clash as regression, intentional evolution, or possibly intentional. Every call is audited with prompt sha + raw response. Empty array on most runs.</p>
+      <div class="schema">
+<pre><code>{
+  "findings": [
+    {
+      "rule_id":           "rule_x9y8",
+      "verdict":           "regression",
+      "confidence":         0.87,
+      "spec_diff_summary": "no spec change covers the new behavior",
+      "prompt_sha":        "sha256:5f3c...",
+      "cost_usd":           0.0008,
+      "arbiter_decision_id": 42
+    }
+  ]
+}</code></pre>
+      </div>
+    </div>
+
+    <!-- Schema 5: how this page wires up -->
+    <div id="wiring" class="panel p-6 mb-6" style="border-left: 4px solid var(--accent);">
+      <h3 class="text-lg font-semibold mb-3">How this page reads data (the wiring)</h3>
+      <p class="muted text-sm mb-4">Single-file HTML, no build step. The page reads run data from two sources, in this order:</p>
+      <ol class="muted text-sm space-y-2 list-decimal list-inside">
+        <li><strong>The local filesystem.</strong> When you open <code>file:///&hellip;/vouch/website/runs.html</code> with a browser that allows local <code>fetch</code> (Safari with Developer &rarr; Disable Local File Restrictions ON, or via <code>python3 -m http.server</code> from the <code>vouch/</code> repo root), the page <code>fetch</code>es <code>../runs/index.json</code> for the manifest and <code>../runs/&lt;run-id&gt;/index.json</code> for each run.</li>
+        <li><strong>An optional <code>vouch serve</code> mode.</strong> When the CLI ships <code>vouch serve --runs-dir ./runs</code>, it exposes a static read-only server on <code>http://localhost:7321</code>. This page detects the server (probes <code>/health</code>), prefers it when present, and falls back to filesystem reads otherwise.</li>
+      </ol>
+      <p class="muted text-sm mt-4">The runs page never invokes an LLM and never writes to disk. Pure read-only render layer.</p>
+
+      <div class="mermaid mt-6">
+flowchart LR
+  CLI["<img src='https://cdn.simpleicons.org/swift/F05138' width='18'/> vouch run"] -->|writes| Dir["<img src='https://cdn.simpleicons.org/files/61DAFB' width='18'/> ./runs/&lt;run-id&gt;/<br/>index.json<br/>deltas.ndjson<br/>snapshots/*.png"]
+  Dir -->|read| Page["<img src='https://cdn.simpleicons.org/html5/E34F26' width='18'/> runs.html"]
+  Serve["<img src='https://cdn.simpleicons.org/swift/F05138' width='18'/> vouch serve<br/><i>optional</i>"] -.->|HTTP GET| Page
+  Dir -.->|optional<br/>via vouch serve| Serve
+  classDef d fill:#1a2236,stroke:#6366f1,color:#e2e8f0
+      </div>
+    </div>
+
+    <!-- Footer note -->
+    <p class="muted text-xs mt-8 max-w-3xl">All panels above are schema documentation; none of the values are real measurements. As soon as the first <code>vouch run</code> writes <code>./runs/&lt;run-id&gt;/index.json</code>, the empty state hides itself and the panels populate from real data.</p>
+  </div>
+</section>
+
+<footer class="py-12" style="background: var(--bg2); border-top: 1px solid var(--border);">
+  <div class="max-w-7xl mx-auto px-6 flex flex-wrap justify-between items-start gap-6">
+    <div>
+      <div class="flex items-center gap-3 mb-3">
+        <div class="w-8 h-8 rounded-lg flex items-center justify-center font-bold text-white" style="background: linear-gradient(135deg, #6366f1 0%, #34d399 100%);">V</div>
+        <span class="font-bold text-lg">Vouch</span>
+      </div>
+      <p class="text-sm muted max-w-md">Runs viewer. Live as soon as the first <code>vouch run</code> writes to disk.</p>
+    </div>
+    <div class="flex flex-col gap-2 text-sm">
+      <a href="index.html" class="nav-link">&larr; Architecture</a>
+      <a href="https://github.com/scott-lydon/vouch" class="nav-link">GitHub</a>
+      <a href="https://github.com/scott-lydon/vouch/blob/main/tasks.md" class="nav-link">tasks.md</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'dark',
+    securityLevel: 'loose',
+    themeVariables: {
+      darkMode: true,
+      background: '#1a2236',
+      primaryColor: '#1a2236',
+      primaryTextColor: '#e2e8f0',
+      primaryBorderColor: '#6366f1',
+      lineColor: '#94a3b8',
+      secondaryColor: '#232d44',
+      tertiaryColor: '#0a0e1a'
+    }
+  });
+
+  // Future wiring: when a runs/ directory exists, this block will fetch the manifest
+  // and replace the empty state with real timeline + FSM diff + arbitration data.
+  // For now it logs a single line to the console so the contract is visible to
+  // anyone opening DevTools.
+  (async function tryLoadRuns() {
+    try {
+      const res = await fetch('../runs/index.json');
+      if (!res.ok) {
+        console.info('[vouch/runs] no runs/index.json yet (HTTP ' + res.status + '). Empty state is the honest render.');
+        return;
+      }
+      const manifest = await res.json();
+      console.info('[vouch/runs] manifest detected with ' + (manifest.runs?.length ?? 0) + ' runs. Real-data render path will hide the empty state — not yet implemented because no runs exist.');
+    } catch (e) {
+      // file:// fetch from another file:// is blocked by most browsers; this is expected
+      // until `vouch serve` ships or the user runs `python3 -m http.server` from vouch/.
+      console.info('[vouch/runs] cannot fetch ../runs/index.json from this context. Open via `python3 -m http.server` from the vouch/ repo root, or run `vouch serve` once it ships.');
+    }
+  })();
+</script>
+
+</body>
+</html>

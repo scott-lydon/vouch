@@ -196,7 +196,17 @@ program
     const actionsById = new Map(actions.map((a) => [a.id, a]));
     let totalCost = 0;
     for (const perm of perms) {
-      const res = await predictOne({ permutation: perm, actionsById, specText: project.spec_text }, source);
+      const res = await predictOne(
+        {
+          permutation: perm,
+          actionsById,
+          specText: project.spec_text,
+          projectName: project.name,
+          projectDescription: project.description,
+          targetUrl: opts.target,
+        },
+        source,
+      );
       totalCost += res.cost_usd;
       const existing = getPrediction(db, perm.id);
       upsertPrediction(

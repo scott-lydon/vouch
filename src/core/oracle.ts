@@ -20,7 +20,13 @@ import { spawn, spawnSync } from "node:child_process";
 
 import Anthropic from "@anthropic-ai/sdk";
 
-import { type Action, type Permutation, type Prediction, type PredictionSource } from "./types.js";
+import {
+  type Action,
+  type Permutation,
+  type Prediction,
+  type PredictionSource,
+  type Project,
+} from "./types.js";
 
 const MODEL = "claude-haiku-4-5-20251001";
 
@@ -28,6 +34,16 @@ export interface OracleInputs {
   permutation: Permutation;
   actionsById: Map<string, Action>;
   specText: string;
+  /**
+   * Briefing context the oracle needs to define expected behavior accurately.
+   * Without these, the LLM has to infer what the product is, what kind of
+   * user is using it, and what "success" means from the spec alone. Passing
+   * the project's name + description + target URL grounds the prediction in
+   * the actual product instead of treating the spec as a generic blob.
+   */
+  projectName: string;
+  projectDescription: string | null;
+  targetUrl: string;
 }
 
 export interface OracleResult {
@@ -113,17 +129,69 @@ export async function predictOne(
   return predictHeuristic(input);
 }
 
+/**
+ * Build the oracle prompt used by both anthropic-haiku and claude-cli sources.
+ * Shared so the two sources are directly comparable on the dashboard.
+ *
+ * Structure (in order):
+ *   1. ASSIGNMENT — what role you're playing and what you're producing.
+ *   2. CONTEXT SUMMARY — the project name, description, target URL. Grounds
+ *      the prediction in the actual product, not a generic spec blob.
+ *   3. SPEC — the source-of-truth document for what the product is supposed to do.
+ *   4. SEQUENCE — the ordered list of actions Vouch will replay.
+ *   5. CONTRACT — output format and rules. Repeated last so it stays in
+ *      the model's working memory when it starts generating.
+ */
+export function buildOraclePrompt(input: OracleInputs): string {
+  const sequenceText = describeSequence(input);
+  const descLine = input.projectDescription
+    ? `Project description: ${input.projectDescription}`
+    : `Project description: (none provided at vouch init)`;
+  return [
+    `# Assignment`,
+    ``,
+    `You are the Oracle for Vouch, an agentic Model-Based Testing pipeline. Vouch maps the interactable surface of a product, generates action permutations, and then asks you (the Oracle) to predict the EXPECTED post-state for each permutation given the product's spec. Vouch then actually replays the permutation in a real browser and compares your prediction against the observed outcome.`,
+    ``,
+    `Your prediction IS the expected behavior. Vouch's verdict engine uses it as the source of truth for what should happen. If your prediction is vague or wrong, the verdict engine cannot tell pass from fail.`,
+    ``,
+    `# Context summary`,
+    ``,
+    `Project: ${input.projectName}`,
+    descLine,
+    `Target URL: ${input.targetUrl}`,
+    `This permutation is index ${input.permutation.index} of the run, sequence length ${input.permutation.action_ids.length}.`,
+    ``,
+    `# Spec (the source of truth for what this product should do)`,
+    ``,
+    `"""`,
+    input.specText.slice(0, 8000),
+    `"""`,
+    ``,
+    `# Interaction sequence (in order)`,
+    ``,
+    sequenceText,
+    ``,
+    `# Contract for your response`,
+    ``,
+    `Respond with ONE paragraph (max 80 words) describing the EXPECTED POST-STATE after the final action above completes.`,
+    ``,
+    `Hard rules:`,
+    `- One paragraph. No bullets. No multiple paragraphs.`,
+    `- No preamble. First word is the observation, not "Here..." / "I think..." / "Based on the spec...".`,
+    `- Concrete. Name elements that should be visible, URL changes, error message text (quote verbatim if the spec specifies it), validation states.`,
+    `- Grounded in the spec. If the spec contradicts a common-sense default, follow the spec.`,
+    `- Predict the observable state, not the implementation. A user looking at the browser. Not "React state will update".`,
+    `- Order matters. Action 1 happens THEN action 2. If action 1's effect would prevent action 2, predict that failure explicitly.`,
+    `- The "type" action only ever appears in a sequence after a "focus_input" on the same selector. Trust that constraint.`,
+    `- If the spec is silent on a behavior, say so briefly ("Spec is silent on X; expect default browser behavior of Y") rather than inventing.`,
+    ``,
+    `Emit only the paragraph.`,
+  ].join("\n");
+}
+
 async function predictWithAnthropic(input: OracleInputs): Promise<OracleResult> {
   const client = new Anthropic({});
-  const sequenceText = describeSequence(input);
-  const prompt =
-    `You are predicting what a user will OBSERVE after running a short interaction ` +
-    `sequence against a web page. Use the project spec to ground your answer in real expected behavior.\n\n` +
-    `Project spec:\n"""\n${input.specText.slice(0, 8000)}\n"""\n\n` +
-    `Interaction sequence (in order):\n${sequenceText}\n\n` +
-    `Respond with ONE paragraph (max 80 words) describing the expected post-state. ` +
-    `Be concrete: name elements that should be visible, URL changes, or error messages. ` +
-    `Do not include any preamble or meta-commentary; emit only the paragraph.`;
+  const prompt = buildOraclePrompt(input);
 
   const resp = await client.messages.create({
     model: MODEL,
@@ -164,15 +232,7 @@ async function predictWithAnthropic(input: OracleInputs): Promise<OracleResult> 
  * subscription" rather than a dollar amount when source === "claude-cli".
  */
 async function predictWithClaudeCli(input: OracleInputs): Promise<OracleResult> {
-  const sequenceText = describeSequence(input);
-  const prompt =
-    `You are predicting what a user will OBSERVE after running a short interaction ` +
-    `sequence against a web page. Use the project spec to ground your answer in real expected behavior.\n\n` +
-    `Project spec:\n"""\n${input.specText.slice(0, 8000)}\n"""\n\n` +
-    `Interaction sequence (in order):\n${sequenceText}\n\n` +
-    `Respond with ONE paragraph (max 80 words) describing the expected post-state. ` +
-    `Be concrete: name elements that should be visible, URL changes, or error messages. ` +
-    `Do not include any preamble or meta-commentary; emit only the paragraph.`;
+  const prompt = buildOraclePrompt(input);
 
   const text = await new Promise<string>((resolveCli, rejectCli) => {
     const child = spawn("claude", ["-p", prompt, "--dangerously-skip-permissions"], {
@@ -240,6 +300,11 @@ async function predictWithClaudeCli(input: OracleInputs): Promise<OracleResult> 
 }
 
 function predictHeuristic(input: OracleInputs): OracleResult {
+  // The heuristic does NOT consult the spec (it has no parser); it composes a
+  // sentence per action from generic UI patterns. We do include the project
+  // name in the preamble so the dashboard makes clear that the heuristic
+  // can't define product-specific expected behavior, only generic patterns.
+  const preamble = `On ${input.projectName} (target ${input.targetUrl}), the following generic UI patterns are expected:`;
   const sentences = input.permutation.action_ids.map((id, i) => {
     const a = input.actionsById.get(id);
     if (!a) return `Step ${i + 1}: (unknown action ${id})`;
@@ -261,7 +326,7 @@ function predictHeuristic(input: OracleInputs): OracleResult {
   });
   return {
     source: "heuristic",
-    expected_post_state: sentences.join(" "),
+    expected_post_state: `${preamble} ${sentences.join(" ")}`,
     confidence: 0.5,
     cost_usd: 0,
   };

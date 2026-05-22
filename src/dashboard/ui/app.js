@@ -274,9 +274,13 @@ function renderPermutationCard(p, actions) {
       ])
     : el('div', { class: 'muted text-xs italic mt-3' }, 'Not executed yet.');
 
+  // Permutation ids are globally unique (`<run_id>__perm_00042`). Show only
+  // the short suffix in the UI; the full id is in the data and accessible via
+  // DOM inspection if needed.
+  const shortPermId = p.permutation.id.includes('__') ? p.permutation.id.split('__').pop() : p.permutation.id;
   return el('div', { class: cardClass }, [
     el('div', { class: 'flex items-center justify-between mb-3' }, [
-      el('span', { class: 'font-semibold' }, p.permutation.id),
+      el('span', { class: 'font-semibold' }, shortPermId),
       el('span', { class: 'badge ' + verdictBadge(verdict) }, verdict),
     ]),
     actionsList,

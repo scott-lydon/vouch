@@ -71,7 +71,11 @@ export function generatePermutations(
         );
       }
       const idx = out.length;
-      const id = `perm_${idx.toString().padStart(5, "0")}`;
+      // Permutation ids are globally unique: the SQLite primary key is
+      // permutations.id, so two runs that both have `perm_00000` would
+      // collide. Prefix with runId. The dashboard still renders the short
+      // suffix (everything after the last `__`) so the UI stays readable.
+      const id = `${runId}__perm_${idx.toString().padStart(5, "0")}`;
       out.push({ id, run_id: runId, action_ids: [...sequence], index: idx });
       return;
     }

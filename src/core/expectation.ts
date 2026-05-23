@@ -149,13 +149,107 @@ function parseVerdictText(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Caching + cost helpers, mirrored from oracle.ts. Pricing constants are
+// duplicated rather than imported because the verifier may diverge model
+// choices in the future (e.g. a cheaper rubric-only model). Today both paths
+// run Haiku 4.5 at the same prices.
+// ---------------------------------------------------------------------------
+
+interface AnthropicCacheUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+}
+
+const PRICE_INPUT_PER_MTOK = 1.0;
+const PRICE_OUTPUT_PER_MTOK = 5.0;
+const PRICE_CACHE_WRITE_PER_MTOK = 1.25;
+const PRICE_CACHE_READ_PER_MTOK = 0.1;
+
+function computeAnthropicCost(usage: AnthropicCacheUsage): number {
+  const fresh = usage.input_tokens / 1_000_000;
+  const cw = (usage.cache_creation_input_tokens ?? 0) / 1_000_000;
+  const cr = (usage.cache_read_input_tokens ?? 0) / 1_000_000;
+  const out = usage.output_tokens / 1_000_000;
+  return (
+    fresh * PRICE_INPUT_PER_MTOK +
+    cw * PRICE_CACHE_WRITE_PER_MTOK +
+    cr * PRICE_CACHE_READ_PER_MTOK +
+    out * PRICE_OUTPUT_PER_MTOK
+  );
+}
+
+/**
+ * Verifier system prompt: the contract boilerplate + classification rubric.
+ * Stable across every case in a run, so we mark it cacheable. Project name
+ * and target URL go here too because they are constant for the run.
+ *
+ * The block may sometimes fall below Anthropic's minimum-cacheable threshold
+ * (1024 tokens for Haiku). Setting cache_control is still safe: the API
+ * treats it as a hint and silently skips caching when the threshold is not
+ * met. We always pay batched savings either way.
+ */
+function buildCachedVerifySystemPrompt(input: VerifyInputs): string {
+  return [
+    `You are the Expectation Verifier for Vouch, an agentic Model-Based Testing pipeline.`,
+    `For one or more (expected, observed) pairs, decide whether the two describe the SAME OUTCOME.`,
+    ``,
+    `# Context (stable for this run)`,
+    ``,
+    `Project: ${input.projectName}`,
+    `Target URL: ${input.targetUrl}`,
+    ``,
+    `# Classification rubric (use the same prefixes regardless of how this call is shaped)`,
+    ``,
+    `When MISMATCH or match=false, prefix the reasoning with one of:`,
+    `  "Likely SUT bug:" — the divergence is in required structure, action behavior, named error messages, navigation, validation, or other behavior the spec says should always happen the same way regardless of data.`,
+    `  "Likely spec brittleness:" — the divergence is ONLY in specific counts, names, ids, dates, dollar amounts, or other data that legitimately varies between test runs, AND the structural behavior is otherwise consistent with the spec.`,
+    `When in doubt, prefer "Likely SUT bug:" — a misclassified bug ships; a misclassified brittleness gets quickly downgraded in review.`,
+    ``,
+    `Be strict on match vs mismatch. A permutation that should have shown a success message but instead showed nothing is a MISMATCH, not a match-with-caveat. The classification prefix on the reasoning line helps the operator triage; it does NOT soften the mismatch itself.`,
+  ].join("\n");
+}
+
+/** Variable per-call content for the single-case path. */
+function buildVerifyUserPrompt(input: VerifyInputs): string {
+  return [
+    `# Expected (Oracle's prediction)`,
+    ``,
+    `"""`,
+    input.expectedPostState,
+    `"""`,
+    ``,
+    `# Observed (Executor's capture from the real browser)`,
+    ``,
+    `"""`,
+    input.observedPostState,
+    `"""`,
+    ``,
+    `# Contract for your response`,
+    ``,
+    `Respond with EXACTLY two lines, in this order:`,
+    `Line 1: the word MATCH or MISMATCH (uppercase, nothing else on the line).`,
+    `Line 2: one sentence (max 40 words) explaining the call. If MISMATCH, name the specific divergence and prefix with the classification described above.`,
+    ``,
+    `Emit nothing else: no preamble, no markdown, no JSON, just the two lines.`,
+  ].join("\n");
+}
+
 async function verifyWithAnthropic(input: VerifyInputs): Promise<ExpectationVerdict> {
   const client = new Anthropic({});
-  const prompt = buildVerifyPrompt(input);
   const resp = await client.messages.create({
     model: MODEL,
     max_tokens: 128,
-    messages: [{ role: "user", content: prompt }],
+    system: [
+      {
+        type: "text",
+        text: buildCachedVerifySystemPrompt(input),
+        cache_control: { type: "ephemeral" },
+      },
+    ],
+    messages: [{ role: "user", content: buildVerifyUserPrompt(input) }],
   });
   const text = resp.content
     .filter((c) => c.type === "text")
@@ -165,9 +259,7 @@ async function verifyWithAnthropic(input: VerifyInputs): Promise<ExpectationVerd
   if (!text) {
     throw new Error(`Anthropic returned empty response (stop_reason=${resp.stop_reason})`);
   }
-  const inTok = resp.usage.input_tokens;
-  const outTok = resp.usage.output_tokens;
-  const cost = (inTok / 1_000_000) * 1 + (outTok / 1_000_000) * 5;
+  const cost = computeAnthropicCost(resp.usage as AnthropicCacheUsage);
   return parseVerdictText(text, "anthropic-haiku", input.permutationId, Number(cost.toFixed(6)));
 }
 
@@ -450,6 +542,137 @@ export async function verifyManyClaudeCliOrFallback(
       } catch (innerErr) {
         process.stderr.write(
           `[vouch/verify] per-perm fallback also failed for '${input.permutationId}'; ` +
+            `using heuristic. Underlying: ${(innerErr as Error).message}\n`,
+        );
+        out.push(verifyHeuristic(input));
+      }
+    }
+    return out;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Batched Anthropic verifier with the same caching pattern as the oracle:
+// the contract preamble + classification rubric live in the cached system
+// block, and the variable per-case content (expected + observed) lives in
+// the user message. Combined with N-case batching this brings a verify pass
+// to single-digit cents on a typical run, vs the subscription drain caused
+// by claude-cli when run at depth.
+// ---------------------------------------------------------------------------
+
+function buildBatchedVerifyUserPrompt(inputs: VerifyInputs[]): string {
+  const cases: string[] = [];
+  for (let i = 0; i < inputs.length; i++) {
+    const inp = inputs[i]!;
+    cases.push(
+      `## Case ${i + 1} (permutation_id=${inp.permutationId})\n` +
+        `### Expected (Oracle's prediction)\n"""\n${inp.expectedPostState}\n"""\n` +
+        `### Observed (Executor's capture)\n"""\n${inp.observedPostState}\n"""`,
+    );
+  }
+  return [
+    `In this call you are verifying ${inputs.length} cases at once (batched for throughput). Return one verdict per case, in order, in a JSON array.`,
+    ``,
+    `# Cases to verify (${inputs.length} total, in order)`,
+    ``,
+    cases.join("\n\n"),
+    ``,
+    `# Contract for your response`,
+    ``,
+    `Return EXACTLY a JSON array of ${inputs.length} objects, in the same order as the cases above. Schema per object:`,
+    `  { "case_index": <1-based integer>, "match": <true | false>, "reasoning": "<one sentence, max 40 words>" }`,
+    ``,
+    `For each verdict:`,
+    `- match=true means expected and observed describe the same outcome.`,
+    `- match=false means they diverge in a way a user would notice.`,
+    `- reasoning is one sentence. If match=false, follow the classification rubric in the system prompt (prefix with "Likely SUT bug:" or "Likely spec brittleness:").`,
+    ``,
+    `Hard rules for the response itself:`,
+    `- Emit a SINGLE JSON array. No markdown fence, no preamble, no trailing prose.`,
+    `- All ${inputs.length} entries present. case_index runs 1..${inputs.length} with no gaps.`,
+    `- match is a JSON boolean (true/false), not the string "MATCH"/"MISMATCH".`,
+    `- Valid JSON parseable by JSON.parse on the exact stdout.`,
+    ``,
+    `Emit only the JSON array.`,
+  ].join("\n");
+}
+
+export async function verifyManyWithAnthropic(
+  inputs: VerifyInputs[],
+): Promise<ExpectationVerdict[]> {
+  if (inputs.length === 0) return [];
+  if (inputs.length === 1) {
+    return [await verifyWithAnthropic(inputs[0]!)];
+  }
+
+  const first = inputs[0]!;
+  for (const inp of inputs) {
+    if (inp.projectName !== first.projectName || inp.targetUrl !== first.targetUrl) {
+      throw new Error(
+        `verifyManyWithAnthropic: batch contains cases from different projects/targets.`,
+      );
+    }
+  }
+
+  const client = new Anthropic({});
+  const resp = await client.messages.create({
+    model: MODEL,
+    // Two lines per case at ~50 tokens each + JSON scaffolding. Capped to
+    // stop a runaway from blowing the output budget.
+    max_tokens: Math.min(8192, 120 * inputs.length + 256),
+    system: [
+      {
+        type: "text",
+        text: buildCachedVerifySystemPrompt(first),
+        cache_control: { type: "ephemeral" },
+      },
+    ],
+    messages: [{ role: "user", content: buildBatchedVerifyUserPrompt(inputs) }],
+  });
+  const text = resp.content
+    .filter((c) => c.type === "text")
+    .map((c) => (c as { text: string }).text)
+    .join("\n")
+    .trim();
+  if (!text) {
+    throw new Error(
+      `Anthropic batched verify call returned empty response (id=${resp.id}, stop_reason=${resp.stop_reason}). ` +
+        `If stop_reason is "max_tokens", the batch is too large; lower the batch size in cli.ts.`,
+    );
+  }
+
+  const parsed = parseBatchedVerifyResponse(text, inputs.length);
+  const batchCost = computeAnthropicCost(resp.usage as AnthropicCacheUsage);
+  const perPerm = Number((batchCost / inputs.length).toFixed(6));
+  return inputs.map((input, i) => ({
+    permutation_id: input.permutationId,
+    match: parsed[i]!.match,
+    reasoning: parsed[i]!.reasoning,
+    source: "anthropic-haiku" as PredictionSource,
+    cost_usd: perPerm,
+    generated_at: new Date().toISOString(),
+  }));
+}
+
+/** Public batched entry point with the same fallback contract as the CLI wrapper. */
+export async function verifyManyAnthropicOrFallback(
+  inputs: VerifyInputs[],
+): Promise<ExpectationVerdict[]> {
+  if (inputs.length === 0) return [];
+  try {
+    return await verifyManyWithAnthropic(inputs);
+  } catch (err) {
+    process.stderr.write(
+      `[vouch/verify] batched Anthropic call failed (${inputs.length} perms); ` +
+        `falling back to per-perm Anthropic calls. Underlying: ${(err as Error).message}\n`,
+    );
+    const out: ExpectationVerdict[] = [];
+    for (const input of inputs) {
+      try {
+        out.push(await verifyWithAnthropic(input));
+      } catch (innerErr) {
+        process.stderr.write(
+          `[vouch/verify] per-perm Anthropic fallback also failed for '${input.permutationId}'; ` +
             `using heuristic. Underlying: ${(innerErr as Error).message}\n`,
         );
         out.push(verifyHeuristic(input));

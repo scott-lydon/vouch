@@ -27,10 +27,15 @@ import {
   detectOracleSource,
   predictOne,
   predictManyClaudeCliOrFallback,
+  predictManyAnthropicOrFallback,
   asPrediction,
 } from "./core/oracle.js";
 import { executePermutations } from "./core/executor.js";
-import { verifyExpectation, verifyManyClaudeCliOrFallback } from "./core/expectation.js";
+import {
+  verifyExpectation,
+  verifyManyClaudeCliOrFallback,
+  verifyManyAnthropicOrFallback,
+} from "./core/expectation.js";
 import { analyzeRun, cleanCleanRunScreenshots, renderFindingsMarkdown } from "./core/findings.js";
 import { generatePermutationsWithStats } from "./core/permutations.js";
 import { mapSurface } from "./core/surface.js";
@@ -287,7 +292,24 @@ async function runMissingPhases(input: RunMissingPhasesInputs): Promise<void> {
         "\n",
     );
     let oracleCost = 0;
+    // Both batched paths share the same shape (build inputs, slice into
+    // batches, call the batched function, persist results). They only differ
+    // in the call target and the human-readable "batch via..." label, so we
+    // choose the function pointer once and run a single loop.
+    type BatchedPredictFn = typeof predictManyClaudeCliOrFallback;
+    let batchedPredict: BatchedPredictFn | null = null;
+    let batchedLabel = "";
     if (oracleSource === "claude-cli") {
+      batchedPredict = predictManyClaudeCliOrFallback;
+      batchedLabel = "claude-cli";
+    } else if (oracleSource === "anthropic-haiku") {
+      // Batched + spec-prompt-cached. After the first batch in this run, the
+      // spec block hits the 90%-discounted cache-read rate for the next
+      // ~5 minutes.
+      batchedPredict = predictManyAnthropicOrFallback;
+      batchedLabel = "anthropic-haiku (cached)";
+    }
+    if (batchedPredict !== null) {
       const BATCH_SIZE = 30;
       const allInputs = oraclePending.map((perm) => ({
         permutation: perm,
@@ -300,7 +322,7 @@ async function runMissingPhases(input: RunMissingPhasesInputs): Promise<void> {
       for (let i = 0; i < allInputs.length; i += BATCH_SIZE) {
         const batch = allInputs.slice(i, i + BATCH_SIZE);
         const batchStart = Date.now();
-        const results = await predictManyClaudeCliOrFallback(batch);
+        const results = await batchedPredict(batch);
         const elapsedSec = Math.round((Date.now() - batchStart) / 1000);
         for (let j = 0; j < results.length; j++) {
           const res = results[j]!;
@@ -316,7 +338,7 @@ async function runMissingPhases(input: RunMissingPhasesInputs): Promise<void> {
           );
         }
         process.stdout.write(
-          `${logPrefix} oracle batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(allInputs.length / BATCH_SIZE)} done (${batch.length} perms in ${elapsedSec}s)\n`,
+          `${logPrefix} oracle batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(allInputs.length / BATCH_SIZE)} via ${batchedLabel} done (${batch.length} perms in ${elapsedSec}s)\n`,
         );
       }
     } else {
@@ -397,18 +419,34 @@ async function runMissingPhases(input: RunMissingPhasesInputs): Promise<void> {
         },
       });
     }
+    // Pick a batched verifier when the source supports one and we have
+    // enough cases for batching to pay back its overhead (single-case
+    // batches just call the per-perm path under the hood).
+    type BatchedVerifyFn = typeof verifyManyClaudeCliOrFallback;
+    let batchedVerify: BatchedVerifyFn | null = null;
+    let batchedVerifyLabel = "";
+    if (verifySource === "claude-cli" && jobs.length > 1) {
+      batchedVerify = verifyManyClaudeCliOrFallback;
+      batchedVerifyLabel = "claude-cli";
+    } else if (verifySource === "anthropic-haiku" && jobs.length > 1) {
+      // Batched + rubric-prompt-cached. Less savings than the oracle's
+      // spec-block cache (the rubric is smaller and sometimes below
+      // Anthropic's min-cacheable threshold) but batching alone still
+      // amortizes the per-call HTTP and auth overhead.
+      batchedVerify = verifyManyAnthropicOrFallback;
+      batchedVerifyLabel = "anthropic-haiku (cached)";
+    }
     if (jobs.length === 0) {
       process.stdout.write(`${logPrefix} verify: 0 missing verdicts, skipping.\n`);
-    } else if (verifySource === "claude-cli" && jobs.length > 1) {
-      // Same batch sizing as the oracle (30). Same rationale: spec-text is
-      // constant across perms in a batch and dominates input size; output
-      // is shorter than the oracle (a verdict + 1 sentence vs a paragraph),
-      // so 30 fits comfortably in the model's output budget.
+    } else if (batchedVerify !== null) {
+      // Same batch sizing as the oracle (30). Output is shorter than the
+      // oracle (a verdict + 1 sentence vs a paragraph), so 30 fits
+      // comfortably in the model's output budget.
       const BATCH_SIZE = 30;
       for (let i = 0; i < jobs.length; i += BATCH_SIZE) {
         const batchJobs = jobs.slice(i, i + BATCH_SIZE);
         const batchStart = Date.now();
-        const verdicts = await verifyManyClaudeCliOrFallback(batchJobs.map((j) => j.input));
+        const verdicts = await batchedVerify(batchJobs.map((j) => j.input));
         const elapsedSec = Math.round((Date.now() - batchStart) / 1000);
         for (let j = 0; j < verdicts.length; j++) {
           const v = verdicts[j]!;
@@ -416,7 +454,7 @@ async function runMissingPhases(input: RunMissingPhasesInputs): Promise<void> {
           upsertExpectationVerdict(db, v);
         }
         process.stdout.write(
-          `${logPrefix} verify batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(jobs.length / BATCH_SIZE)} done (${batchJobs.length} perms in ${elapsedSec}s)\n`,
+          `${logPrefix} verify batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(jobs.length / BATCH_SIZE)} via ${batchedVerifyLabel} done (${batchJobs.length} perms in ${elapsedSec}s)\n`,
         );
       }
     } else {

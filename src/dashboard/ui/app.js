@@ -154,13 +154,24 @@ async function viewRun(runId) {
   // and matches the badges on each card below. Playwright-only counts (pass /
   // fail / timeout) are surfaced as a secondary breakdown so both views are
   // available without contradicting each other.
-  const primaryCounts = { verified: 0, bug_candidate: 0, flagged: 0, crashed: 0, not_verified: 0, not_executed: 0 };
+  const primaryCounts = {
+    verified: 0,
+    verified_with_concerns: 0,
+    spec_brittleness: 0,
+    bug_candidate: 0,
+    flagged: 0,
+    crashed: 0,
+    not_verified: 0,
+    not_executed: 0,
+  };
   const playwrightCounts = { pass: 0, fail: 0, timeout: 0, infrastructure_error: 0, missing_input: 0, pending: 0 };
   for (const p of permutations) {
     const pwVerdict = p.execution?.verdict ?? 'pending';
     playwrightCounts[pwVerdict] = (playwrightCounts[pwVerdict] ?? 0) + 1;
-    const primary = primaryVerdict(pwVerdict, p.expectation);
+    const primary = primaryVerdict(pwVerdict, p.expectation, p.execution);
     if (primary.label === 'VERIFIED') primaryCounts.verified++;
+    else if (primary.label === 'VERIFIED WITH CONCERNS') primaryCounts.verified_with_concerns++;
+    else if (primary.label === 'SPEC BRITTLENESS') primaryCounts.spec_brittleness++;
     else if (primary.label === 'BUG CANDIDATE') primaryCounts.bug_candidate++;
     else if (primary.label === 'FLAGGED (rules)') primaryCounts.flagged++;
     else if (primary.label === 'CRASHED') primaryCounts.crashed++;
@@ -203,12 +214,19 @@ async function viewRun(runId) {
       ]),
 
       // PRIMARY stats — what the operator cares about, matches the cards below.
+      // Two rows so the new yellow-tier counters (with concerns, spec brittleness)
+      // get their own real estate without crowding the green/red headliners.
       el('div', { class: 'grid md:grid-cols-3 lg:grid-cols-6 gap-3 mb-3' }, [
         statCard('Permutations', permutations.length, 'badge-accent'),
         statCard('Verified',     primaryCounts.verified, 'badge-good'),
+        statCard('With concerns', primaryCounts.verified_with_concerns, 'badge-warn'),
+        statCard('Spec brittleness', primaryCounts.spec_brittleness, 'badge-warn'),
         statCard('Bug candidate', primaryCounts.bug_candidate, 'badge-bad'),
-        statCard('Flagged (rules)', primaryCounts.flagged, 'badge-warn'),
         statCard('Crashed', primaryCounts.crashed, 'badge-bad'),
+      ]),
+      el('div', { class: 'grid md:grid-cols-3 lg:grid-cols-3 gap-3 mb-3' }, [
+        statCard('Flagged (rules)', primaryCounts.flagged, 'badge-warn'),
+        statCard('Not verified', primaryCounts.not_verified, 'badge-warn'),
         statCard('Source', sourceLabel(run.prediction_source), run.prediction_source === 'heuristic' ? 'badge-warn' : 'badge-good'),
       ]),
       // Secondary: raw Playwright-execution breakdown for debugging.
@@ -280,10 +298,22 @@ function detailsPanel(title, content) {
 }
 
 /**
- * Compute the single primary verdict for a card. Combines Playwright
- * verdict + verifier verdict + verifier source into one human label.
+ * Compute the single primary verdict for a card. Combines Playwright verdict
+ * + verifier verdict + verifier source + browser anomalies captured by the
+ * executor into one human label, and one of three tiers (green / yellow /
+ * red) via the badge class.
+ *
+ * Tier rules:
+ *   - green  (badge-good): expected matched observed AND no anomalies fired.
+ *   - yellow (badge-warn): everything that walked but is not pristine. This
+ *     includes VERIFIED WITH CONCERNS (match but console errors / 5xx /
+ *     etc were observed), spec-brittleness mismatches, the heuristic
+ *     verifier's noise tier, and "expected verdict missing" cases.
+ *   - red    (badge-bad):  crash, or LLM mismatch the verifier classified
+ *     as "Likely SUT bug" (or any mismatch where classification is missing,
+ *     because the rubric says when in doubt prefer SUT bug).
  */
-function primaryVerdict(playwrightVerdict, expectation) {
+function primaryVerdict(playwrightVerdict, expectation, execution) {
   if (!playwrightVerdict || playwrightVerdict === 'pending') {
     return { label: 'NOT EXECUTED', badge: 'badge-warn', explainer: 'Vouch has not replayed this permutation yet.' };
   }
@@ -302,26 +332,80 @@ function primaryVerdict(playwrightVerdict, expectation) {
       explainer: 'The steps ran clean, but the expectation diff pass did not run for this permutation. Run with --verify to fill in this column.',
     };
   }
+
+  // Anomalies the executor captured: console errors, page errors, 4xx/5xx,
+  // failed requests. Empty array (or undefined for older DB rows) means a
+  // clean run on that axis.
+  const anomalies = Array.isArray(execution?.anomalies) ? execution.anomalies : [];
+  const anomalySummary = summarizeAnomalies(anomalies);
+
   if (expectation.match) {
+    if (anomalies.length === 0) {
+      return {
+        label: 'VERIFIED',
+        badge: 'badge-good',
+        explainer: `The page's observed state matched the AI's predicted expected behavior (verifier: ${expectation.source}).`,
+      };
+    }
     return {
-      label: 'VERIFIED',
-      badge: 'badge-good',
-      explainer: `The page's observed state matched the AI's predicted expected behavior (verifier: ${expectation.source}).`,
+      label: 'VERIFIED WITH CONCERNS',
+      badge: 'badge-warn',
+      explainer:
+        `The page's observed state matched the AI prediction (verifier: ${expectation.source}), ` +
+        `but the browser logged ${anomalies.length} anomal${anomalies.length === 1 ? 'y' : 'ies'} during the run: ${anomalySummary}. ` +
+        `The user-visible outcome looked right; something underneath did not. Worth a look.`,
     };
   }
-  // Mismatch. Severity depends on verifier source.
+
+  // Mismatch. Severity depends on verifier source AND classification.
   if (expectation.source === 'heuristic') {
     return {
       label: 'FLAGGED (rules)',
       badge: 'badge-warn',
-      explainer: 'The no-LLM rule-based verifier saw low text overlap between expected and observed. This verifier over-flags by design — treat as a hint that warrants a closer look, not a confirmed SUT bug. For a real semantic verdict, run with --verify-source claude-cli or anthropic-haiku.',
+      explainer: 'The no-LLM rule-based verifier saw low text overlap between expected and observed. This verifier over-flags by design; treat as a hint that warrants a closer look, not a confirmed SUT bug. For a real semantic verdict, run with --verify-source claude-cli or anthropic-haiku.',
+    };
+  }
+  // LLM verifier mismatch. Read the classification prefix the rubric asks
+  // the model to emit. "Likely spec brittleness" demotes to yellow.
+  const reasoning = String(expectation.reasoning ?? '');
+  if (/^\s*Likely\s+spec\s+brittleness/i.test(reasoning)) {
+    return {
+      label: 'SPEC BRITTLENESS',
+      badge: 'badge-warn',
+      explainer:
+        `The verifier (${expectation.source}) flagged a mismatch BUT classified it as data-driven variation (specific counts, names, dates) rather than a real SUT bug. ` +
+        `The structural behavior matched what the spec describes. Review the reasoning below to confirm.`,
     };
   }
   return {
     label: 'BUG CANDIDATE',
     badge: 'badge-bad',
-    explainer: `The page's observed state semantically diverges from the AI's prediction (verifier: ${expectation.source}). Either the SUT has a bug, or the prediction was wrong. Edit the operator note below to record the right answer.`,
+    explainer:
+      `The page's observed state semantically diverges from the AI's prediction in a way the verifier flagged as a likely SUT bug (verifier: ${expectation.source}). ` +
+      (anomalies.length > 0 ? `The browser also logged anomalies during the run: ${anomalySummary}. ` : '') +
+      `Edit the operator note below to record the right answer.`,
   };
+}
+
+/**
+ * Short one-line summary of an anomaly array for the verdict explainer.
+ * Groups by kind and shows the most common message of each kind. Truncated
+ * so a single screaming console.error firing 500 times doesn't fill the card.
+ */
+function summarizeAnomalies(anomalies) {
+  if (!anomalies || anomalies.length === 0) return '';
+  const byKind = {};
+  for (const a of anomalies) {
+    if (!byKind[a.kind]) byKind[a.kind] = [];
+    byKind[a.kind].push(a.message ?? '');
+  }
+  const parts = [];
+  for (const kind of Object.keys(byKind)) {
+    const msgs = byKind[kind];
+    const sample = (msgs[0] ?? '').slice(0, 120);
+    parts.push(`${msgs.length}x ${kind}${sample ? ` ("${sample}${sample.length >= 120 ? '...' : ''}")` : ''}`);
+  }
+  return parts.join('; ');
 }
 
 /**
@@ -363,9 +447,12 @@ function stepsVerdictLabel(v) {
 function renderPermutationCard(p, actions) {
   const playwrightVerdict = p.execution?.verdict ?? 'pending';
   const exp = p.expectation;
-  const primary = primaryVerdict(playwrightVerdict, exp);
+  const primary = primaryVerdict(playwrightVerdict, exp, p.execution);
 
   // Card border tint based on primary verdict, not just Playwright.
+  // The 'pending' class is what the existing CSS uses for the yellow tier,
+  // so VERIFIED WITH CONCERNS, SPEC BRITTLENESS, FLAGGED (rules), and the
+  // NOT_* labels all share it. CRASHED and BUG CANDIDATE stay red.
   let cardClass = 'perm-card ';
   if (primary.label === 'VERIFIED') cardClass += 'pass';
   else if (primary.label === 'CRASHED' || primary.label === 'BUG CANDIDATE') cardClass += 'fail';

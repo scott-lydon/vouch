@@ -30,6 +30,26 @@ import {
 
 const MODEL = "claude-haiku-4-5-20251001";
 
+/**
+ * Maximum spec length sent to the oracle, in characters.
+ *
+ * Why 32k chars (~8k tokens): real-world product specs rarely exceed this
+ * (the Meridian spec is 17 kB, Vouch's own dashboard spec is much smaller).
+ * The previous limit of 8000 chars truncated the back half of any non-trivial
+ * spec, which meant the oracle was blind to many acceptance criteria and
+ * produced predictions only against the first ~2k tokens of the spec.
+ *
+ * Why not unlimited: a runaway 200 kB spec would put us well into the
+ * input-token budget where caching no longer dominates (each cache READ
+ * still bills 0.10x input price, and at 50k+ tokens that becomes a real
+ * line item). 32k chars is the largest spec that comfortably amortizes.
+ *
+ * If specs ever genuinely exceed 32k chars, the right move is smart
+ * chunking (send only the spec sections relevant to the action sequence),
+ * not a higher truncation cap.
+ */
+const MAX_SPEC_CHARS = 32_000;
+
 export interface OracleInputs {
   permutation: Permutation;
   actionsById: Map<string, Action>;
@@ -167,7 +187,7 @@ export function buildOraclePrompt(input: OracleInputs): string {
     `# Spec (the source of truth for what this product should do)`,
     ``,
     `"""`,
-    input.specText.slice(0, 8000),
+    input.specText.slice(0, MAX_SPEC_CHARS),
     `"""`,
     ``,
     `# Interaction sequence (in order)`,
@@ -267,7 +287,7 @@ function buildCachedOracleSystemPrompt(input: OracleInputs): string {
     `# Spec (the source of truth for what this product should do)`,
     ``,
     `"""`,
-    input.specText.slice(0, 8000),
+    input.specText.slice(0, MAX_SPEC_CHARS),
     `"""`,
   ].join("\n");
 }
@@ -573,7 +593,7 @@ function buildBatchedOraclePrompt(inputs: OracleInputs[]): string {
     `# Spec (the source of truth for what this product should do)`,
     ``,
     `"""`,
-    first.specText.slice(0, 8000),
+    first.specText.slice(0, MAX_SPEC_CHARS),
     `"""`,
     ``,
     `# Permutations to predict (${inputs.length} total, in order)`,

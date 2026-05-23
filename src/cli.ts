@@ -72,6 +72,25 @@ const DB_PATH = process.env.VOUCH_DB_PATH ?? resolve(process.cwd(), "vouch.db");
 function nowIso(): string {
   return new Date().toISOString();
 }
+
+/**
+ * Parse a positive-integer env var. Returns undefined if absent or unparseable
+ * (so the caller falls back to the executor's compiled defaults). We refuse
+ * to silently treat a typo'd env var as zero, which would disable the cap
+ * entirely and re-introduce the indefinite-hang bug the cap exists to prevent.
+ */
+function parsePositiveIntEnv(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return undefined;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) {
+    process.stderr.write(
+      `[vouch] env ${name}='${raw}' is not a positive integer (ms); ignoring and using the compiled default.\n`,
+    );
+    return undefined;
+  }
+  return n;
+}
 function shortId(prefix: string): string {
   const t = new Date().toISOString().replace(/[:.]/g, "-");
   const r = createHash("sha256").update(`${t}-${Math.random()}`).digest("hex").slice(0, 6);
@@ -94,9 +113,9 @@ program
     if (process.env.VOUCH_ORACLE) {
       lines.push(`                    (forced by VOUCH_ORACLE=${process.env.VOUCH_ORACLE})`);
     } else if (source === "claude-cli") {
-      lines.push(`                    (default because the 'claude' CLI is on PATH; uses your Claude subscription, ~5-15s per permutation)`);
+      lines.push(`                    (default because the 'claude' CLI is on PATH and ANTHROPIC_API_KEY is not set; uses your Claude subscription, ~5-15s per permutation)`);
     } else if (source === "anthropic-haiku") {
-      lines.push(`                    (default because ANTHROPIC_API_KEY is set and 'claude' CLI is not on PATH; ~1-2s per permutation, billed per token)`);
+      lines.push(`                    (default because ANTHROPIC_API_KEY is set; ~1-2s per permutation, billed per token, with prompt caching active so re-runs in the same 5-min window are ~90% cheaper)`);
     } else {
       lines.push(`                    (no LLM source available; install 'claude' CLI for free predictions via subscription, or set ANTHROPIC_API_KEY for API)`);
     }
@@ -379,9 +398,17 @@ async function runMissingPhases(input: RunMissingPhasesInputs): Promise<void> {
         "\n",
     );
     const screenshotsDir = input.screenshots ? resolve(process.cwd(), "runs", runId, "screenshots") : null;
+    // Honor the env vars the executor's timeout error messages advertise.
+    // The executor advertises VOUCH_PERM_TIMEOUT_MS and VOUCH_LAUNCH_TIMEOUT_MS
+    // in its error hints; not reading them here would render the hints dead
+    // references (qa-adversary Finding 1, 2026-05-22).
+    const envPermTimeout = parsePositiveIntEnv("VOUCH_PERM_TIMEOUT_MS");
+    const envLaunchTimeout = parsePositiveIntEnv("VOUCH_LAUNCH_TIMEOUT_MS");
     const execs = await executePermutations(executorPending, actionsById, {
       targetUrl,
       screenshotsDir,
+      ...(envPermTimeout !== undefined ? { permTimeoutMs: envPermTimeout } : {}),
+      ...(envLaunchTimeout !== undefined ? { launchTimeoutMs: envLaunchTimeout } : {}),
     });
     for (const e of execs) upsertExecution(db, e);
     const counts = execs.reduce<Record<string, number>>((acc, e) => {

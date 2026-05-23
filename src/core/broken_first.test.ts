@@ -29,7 +29,7 @@ import {
   unblockPrefixById,
   type DBHandle,
 } from "./db.js";
-import { sequenceKey } from "./sequences.js";
+import { partitionPermsForRetest, sequenceKey } from "./sequences.js";
 
 // ---------------------------------------------------------------------------
 // 1. sequenceKey
@@ -180,8 +180,9 @@ describe("listActiveBlockedPrefixesAtDepth", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 3. Partition logic (mirrors the inline filter inside runOneDepth so the
-//    invariant is testable in isolation).
+// 3. Partition logic. Imported from sequences.ts so this test exercises the
+//    SAME implementation that runOneDepth uses — no parallel test copy to
+//    drift out of sync.
 // ---------------------------------------------------------------------------
 
 interface PermLike {
@@ -189,23 +190,7 @@ interface PermLike {
   action_ids: string[];
 }
 
-/**
- * Partition perms into "priority" (action_ids matches one of retestSequences)
- * and "rest". Mirrors the inline behavior in runOneDepth so a regression
- * there can be caught by a unit test rather than a campaign run.
- */
-function partitionPermsForRetest<T extends PermLike>(
-  perms: readonly T[],
-  retestSequences: readonly string[][],
-): { priority: T[]; rest: T[] } {
-  const keys = new Set(retestSequences.map(sequenceKey));
-  return {
-    priority: perms.filter((p) => keys.has(sequenceKey(p.action_ids))),
-    rest: perms.filter((p) => !keys.has(sequenceKey(p.action_ids))),
-  };
-}
-
-describe("partitionPermsForRetest (mirrors runOneDepth's inline split)", () => {
+describe("partitionPermsForRetest (shared with runOneDepth)", () => {
   const perms: PermLike[] = [
     { id: "p1", action_ids: ["a", "b"] },
     { id: "p2", action_ids: ["a", "c"] },

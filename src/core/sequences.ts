@@ -30,3 +30,38 @@ const UNIT_SEPARATOR = "";
 export function sequenceKey(actionIds: readonly string[]): string {
   return actionIds.join(UNIT_SEPARATOR);
 }
+
+/**
+ * Anything that carries an ordered action_ids list and an id. Both
+ * Permutation (planner output) and BlockedPrefix-derived placeholders fit.
+ * Defined as a structural type so callers don't have to import or extend a
+ * concrete class.
+ */
+export interface HasActionIds {
+  readonly id: string;
+  readonly action_ids: readonly string[];
+}
+
+/**
+ * Split a list of perms into "priority" (matches one of the target
+ * sequences) and "rest" (everything else). Used by runOneDepth's broken-
+ * first scheduler. Exported (rather than inlined) so the unit tests and
+ * the production code path are the SAME implementation — keeps a parallel
+ * test copy from drifting from the prod copy.
+ *
+ * Matching is on the ordered action_ids list, not on perm id, because perm
+ * ids change every run (they include the run id).
+ */
+export function partitionPermsForRetest<T extends HasActionIds>(
+  perms: readonly T[],
+  targetSequences: readonly (readonly string[])[],
+): { priority: T[]; rest: T[] } {
+  const keys = new Set(targetSequences.map(sequenceKey));
+  const priority: T[] = [];
+  const rest: T[] = [];
+  for (const p of perms) {
+    if (keys.has(sequenceKey(p.action_ids))) priority.push(p);
+    else rest.push(p);
+  }
+  return { priority, rest };
+}

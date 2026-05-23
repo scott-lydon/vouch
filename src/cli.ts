@@ -38,7 +38,7 @@ import {
 } from "./core/expectation.js";
 import { analyzeRun, cleanCleanRunScreenshots, renderFindingsMarkdown } from "./core/findings.js";
 import { generatePermutationsWithStats } from "./core/permutations.js";
-import { sequenceKey } from "./core/sequences.js";
+import { partitionPermsForRetest, sequenceKey } from "./core/sequences.js";
 import { mapSurface } from "./core/surface.js";
 import {
   finalizeRun,
@@ -281,9 +281,12 @@ async function runOneDepth(input: RunOneDepthInputs): Promise<string> {
 
   // Partition perms into "priority" (matches one of the retest sequences) and
   // "rest". Match is on action_ids equality, not perm_id, because perm_ids
-  // change on every run.
-  const priorityPerms = perms.filter((p) => retestSequenceKeys.has(sequenceKey(p.action_ids)));
-  const restPerms = perms.filter((p) => !retestSequenceKeys.has(sequenceKey(p.action_ids)));
+  // change on every run. Shared with the unit tests via sequences.ts so the
+  // two implementations cannot drift.
+  const { priority: priorityPerms, rest: restPerms } = partitionPermsForRetest(
+    perms,
+    retestBlocks.map((b) => b.prefix),
+  );
 
   const actionsById = new Map(actions.map((a) => [a.id, a]));
 

@@ -521,11 +521,24 @@ function renderPermutationCard(p, actions) {
     (p.action_descriptions ?? []).map((ad, i) => {
       if (!ad) return el('div', { class: 'text-sm bad' }, `(unknown action ${i + 1})`);
       const hasDetail = !!(ad.selector || (ad.type_value !== null && ad.type_value !== undefined));
+      // "via catalog: <name>" chip whenever a step's value or file came
+      // from vouch.inputs.yaml. Surfaces operator-supplied input at a
+      // glance so a failed permutation is immediately attributable to a
+      // catalog entry vs. a synthetic value.
+      const catalogChip = ad.catalog_entry_name
+        ? el('span', { class: 'badge badge-good', style: 'margin-left:6px;' },
+            (ad.catalog_fixture_kind === 'catalog' ? 'file: ' : 'value: ') + ad.catalog_entry_name)
+        : null;
+      const sensitiveChip = ad.sensitive
+        ? el('span', { class: 'badge badge-warn', style: 'margin-left:6px;' }, 'sensitive')
+        : null;
       const summaryChildren = [
         el('span', { class: 'kbd' }, `step ${i + 1}`),
         ' ',
         el('span', { class: 'badge badge-accent', style: 'margin-right:6px;' }, ad.kind),
         el('span', {}, ad.description),
+        catalogChip,
+        sensitiveChip,
         hasDetail
           ? el('span', { class: 'muted text-xs ml-2', style: 'opacity:0.6;' }, '› expand')
           : null,

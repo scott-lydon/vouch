@@ -76,15 +76,31 @@ export async function startServer(dbPath: string, port: number): Promise<void> {
         expectation,
         action_descriptions: p.action_ids.map((id) => {
           const a = actions.find((x) => x.id === id);
-          return a
-            ? {
-                id: a.id,
-                kind: a.kind,
-                description: a.description,
-                selector: a.selector,
-                type_value: a.type_value,
-              }
-            : null;
+          if (!a) return null;
+          // Carry the catalog provenance fields the UI needs to render a
+          // "via catalog: <name>" chip. `sensitive` flips redaction on
+          // type_value so wallet seeds / API tokens / env-sourced values
+          // never reach the browser.
+          const meta = a.meta as Record<string, unknown>;
+          const catalogEntryName =
+            typeof meta["catalog_entry_name"] === "string"
+              ? (meta["catalog_entry_name"] as string)
+              : undefined;
+          const sensitive = meta["sensitive"] === true;
+          const fixtureKind =
+            typeof meta["fixture_kind"] === "string"
+              ? (meta["fixture_kind"] as string)
+              : undefined;
+          return {
+            id: a.id,
+            kind: a.kind,
+            description: a.description,
+            selector: a.selector,
+            type_value: sensitive ? "[redacted: catalog-sourced sensitive value]" : a.type_value,
+            catalog_entry_name: catalogEntryName,
+            catalog_fixture_kind: fixtureKind === "catalog" ? "catalog" : undefined,
+            sensitive,
+          };
         }),
       };
     });

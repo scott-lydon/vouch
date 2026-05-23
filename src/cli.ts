@@ -43,6 +43,10 @@ import {
   checkScreenshotForSketchiness,
   detectSketchySource,
 } from "./core/sketchy.js";
+import {
+  fetchHappyPathManifest,
+  lowerHappyPathToRows,
+} from "./core/happy_paths.js";
 import { mapSurface } from "./core/surface.js";
 import {
   finalizeRun,
@@ -259,9 +263,61 @@ async function runOneDepth(input: RunOneDepthInputs): Promise<string> {
   });
 
   process.stdout.write(`[depth ${depth}] mapping ${targetUrl}...\n`);
-  const actions = await mapSurface(targetUrl);
+  const surfaceActions = await mapSurface(targetUrl);
+
+  // ---- Happy-path manifest (optional, SUT-published) ----
+  // Fetch BEFORE inserting actions so the synthesized happy-path action
+  // rows are part of the same atomic insert and the executor can look them
+  // up by id during the run. If the SUT does not publish a manifest, this
+  // is a one-line info log and we proceed with just the surface actions.
+  // If the manifest IS published but invalid, we throw with a clear error
+  // so the SUT operator can fix it fast — silently dropping an invalid
+  // manifest would let domain knowledge rot without anyone noticing.
+  let happyManifest: Awaited<ReturnType<typeof fetchHappyPathManifest>> = null;
+  try {
+    happyManifest = await fetchHappyPathManifest(targetUrl);
+  } catch (err) {
+    process.stderr.write(
+      `[depth ${depth}] happy-paths: manifest published but invalid: ${(err as Error).message}\n`,
+    );
+    // Don't crash the run; continue without the happy paths.
+    happyManifest = null;
+  }
+  const happyActions: typeof surfaceActions = [];
+  const happyPerms: Array<{ perm: import("./core/types.js").Permutation; expected: string }> = [];
+  if (happyManifest && happyManifest.paths.length > 0) {
+    for (let i = 0; i < happyManifest.paths.length; i++) {
+      const lowered = lowerHappyPathToRows(happyManifest.paths[i]!, runId, i);
+      // Dedupe within a single happy path's actions; the same selector +
+      // kind may appear twice across paths and we only want one row.
+      for (const a of lowered.actions) {
+        if (!happyActions.some((existing) => existing.id === a.id)) {
+          happyActions.push(a);
+        }
+      }
+      happyPerms.push({ perm: lowered.permutation, expected: lowered.predictionExpected });
+    }
+    process.stdout.write(
+      `[depth ${depth}] happy-paths: loaded ${happyManifest.paths.length} known-good path${happyManifest.paths.length === 1 ? "" : "s"} from ${targetUrl}/.well-known/vouch-happy-paths.json\n`,
+    );
+  } else {
+    process.stdout.write(
+      `[depth ${depth}] happy-paths: SUT does not publish a manifest at .well-known/vouch-happy-paths.json (this is normal; happy paths are opt-in).\n`,
+    );
+  }
+
+  // Combined actions table for the run: surface-discovered plus happy-path
+  // synthesized. Order does not matter for the executor (lookup is by id)
+  // but we put surface first so the dashboard's actions list is intuitive.
+  const actions = [...surfaceActions, ...happyActions];
   insertActions(db, runId, actions);
-  process.stdout.write(`[depth ${depth}] discovered ${actions.length} actions\n`);
+  process.stdout.write(
+    `[depth ${depth}] discovered ${surfaceActions.length} surface action${surfaceActions.length === 1 ? "" : "s"}` +
+      (happyActions.length > 0
+        ? ` + ${happyActions.length} happy-path action${happyActions.length === 1 ? "" : "s"}`
+        : "") +
+      "\n",
+  );
 
   // ---- Retest plan ----
   // Active blocked prefixes for this project. When retestPreviouslyBroken is
@@ -282,8 +338,38 @@ async function runOneDepth(input: RunOneDepthInputs): Promise<string> {
     blockedPrefixes: filterBlocks.map((b) => b.prefix),
     includeEmptyBaseline: input.includeEmptyBaseline,
   });
-  const perms = planResult.permutations;
+  // Merge: the planner's depth-N perms are the exploratory coverage. The
+  // happy-path perms are the SUT-asserted domain truth — short-circuiting
+  // the random-permutation discovery problem (Carvana's WZY1433 valid VIN
+  // would never have been typed by a permutation generator that doesn't
+  // know what a Texas plate looks like). Happy perms get indices AFTER
+  // the planner's perms so the dashboard ordering is "exploration first,
+  // domain-truth second" — both are visible.
+  const plannerPerms = planResult.permutations;
+  const reindexedHappyPerms = happyPerms.map((hp, i) => ({
+    perm: { ...hp.perm, index: plannerPerms.length + i },
+    expected: hp.expected,
+  }));
+  const perms = [...plannerPerms, ...reindexedHappyPerms.map((hp) => hp.perm)];
   insertPermutations(db, perms);
+
+  // Pre-seed predictions for happy-path perms so the Oracle phase skips the
+  // LLM call for them. The SUT's expectedOutcome IS the prediction — it's
+  // domain truth, not a guess. Lower cost, higher correctness, and the
+  // Verifier compares observed vs this expectation exactly as it would for
+  // an LLM-produced prediction.
+  for (const hp of reindexedHappyPerms) {
+    upsertPrediction(db, {
+      permutation_id: hp.perm.id,
+      source: "heuristic", // tagged "heuristic" because it bypasses the LLM; not noisy like the heuristic verifier.
+      expected_post_state: hp.expected,
+      confidence: 1, // SUT-asserted, treat as authoritative.
+      cost_usd: 0,
+      generated_at: nowIso(),
+      user_note_text: null,
+      user_note_edited_at: null,
+    });
+  }
   process.stdout.write(
     `[depth ${depth}] generated ${perms.length} permutations (depth=${depth}, after rule filtering)` +
       (filterBlocks.length > 0

@@ -156,6 +156,19 @@ When delegating to `claude-code-bridge` or the QA gate, brief the implementing a
 - [ ] Replay run that exercises every documented flag combination AND lets the inducer discover at least one inferred rule about the CLI surface (e.g., `vouch rules show requires-prior vouch run` — you cannot meaningfully run `vouch report` before `vouch run`). Done-criterion validates dogfooding works at the rule-induction layer, not just the verdict layer.
 - [ ] QA gate.
 
+### Slice 12.5 — Operator input catalog (US-14) — SHIPPED 2026-05-23
+
+> Spec story served: US-14. Plan components: surface mapper, executor, dashboard. Rubric: Architecture (typed boundary between operator-supplied data and the crawler) + Security (env-only secret references, redaction-before-display posture).
+
+- [x] `src/core/inputs.ts` — Zod-validated catalog loader at `<project>/vouch.inputs.yaml`. Resolves `value_from_env` / `seed_from_env` at load time, throws with file+path on every failure mode (parse, schema, dup names, forbidden literal-secret keys, missing env var, missing file path).
+- [x] `src/core/inputs.ts` `matchTextEntry` / `matchFileEntry` — three-precedence matcher (selector > exact normalized name > substring) that throws on within-precedence ties so the operator disambiguates by adding a `selector:`.
+- [x] `src/core/surface.ts` — `mapSurface(url, opts, catalog?)` threads the catalog through `walkPage` → `synthesizeActions` → `plausibleValuesFor`. Real values land as a `valid_real_<name>` variant PREPENDED to the synthetic boundary cases. File entries emit an extra `upload_file` Action alongside the synthetic `png_1x1`.
+- [x] `src/core/executor.ts` — `upload_file` honors `fixture_kind: "catalog"` and routes `setInputFiles` at the catalog's absolute path, with a named error when the path has disappeared since map time.
+- [x] `src/cli.ts` — `vouch init` scaffolds an inert (fully-commented) template `vouch.inputs.yaml`; `vouch run` and `vouch map` load the catalog from `process.cwd()` before mapping.
+- [x] `src/dashboard/server.ts` — serializes `catalog_entry_name`, `catalog_fixture_kind`, `sensitive` on each action description; redacts `type_value` to `"[redacted: catalog-sourced sensitive value]"` when sensitive.
+- [x] `src/dashboard/ui/app.js` — step rows show `via catalog: <name>` and a paired `sensitive` warn-badge when the value was env-sourced.
+- [x] `src/core/inputs.test.ts` — 17 tests: load happy path, env-var resolution, sensitive-flag, mutually-exclusive `value` vs `value_from_env`, forbidden literal-secret keys (top-level and nested), missing file path, duplicate names, malformed YAML, three precedence levels of matching, ambiguous-tie throw, file-entry match.
+
 ### Slice 13 — Downstream deliverables
 
 > Per the per-assignment automation rules in `~/Documents/Claude/Projects/Gauntlet/CLAUDE.md`.

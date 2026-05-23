@@ -138,6 +138,20 @@ Symmetrically, a previously promoted rule that accumulates three consecutive den
 
 The Arbiter's verdict, the prompt it used, and the model's raw response are all persisted to `vouch.db` `arbiter_decisions` for audit. A developer can override any Arbiter call with `vouch rules arbitrate <rule_id> --as <verdict>`.
 
+### US-14 — Operator-supplied input catalog drives valid real values
+
+> As an operator, I want Vouch to fill license-plate fields with my real test fleet plates, upload my driver license image into doc-verify uploads, and use my devnet wallet on connect-wallet flows, so that server-side validators actually pass on the happy path while the synthetic boundary cases still run.
+
+**Given** a project root with `vouch.inputs.yaml` declaring `text`, `files`, and `wallets` sections,
+**When** `vouch run` (or `vouch map`) executes,
+**Then** the loader resolves entries up front — substituting `value_from_env` / `seed_from_env` references against `process.env` and erroring before browser launch if any referenced env var is unset, any file path is missing, any entry name collides within a section, or any literal-secret key (`seed`, `mnemonic`, `private_key`, `password`, `api_key`, `secret`) appears at any depth in the file. The surface mapper consults the catalog while emitting actions and AND:
+
+- For each text-like field whose placeholder / name / aria-label / id / label text matches a catalog entry by selector (precedence 1), exact normalized name (2), or substring (3), the mapper emits an additional `type` variant `valid_real_<entry-name>` ahead of the synthetic variants. Ambiguous matches at the same precedence throw at run start with both entry names listed, so the operator disambiguates by adding a `selector:`.
+- For each `<input type=file>` whose `nameAttr` matches a `files[]` catalog entry, the mapper emits an additional `upload_file` action alongside the synthetic `png_1x1` fixture, carrying the catalog entry's absolute path in meta. The executor's `upload_file` honors `fixture_kind: "catalog"` by routing `setInputFiles` to that path and erroring clearly if the path has since disappeared.
+- For every action whose value or file came from the catalog, the dashboard's run-detail page shows a "via catalog: `<name>`" chip on the step row. When the entry was sensitive (env-sourced), the chip is paired with a "sensitive" badge and `type_value` is redacted in the API response — neither the browser nor the SQLite execution row sees the literal secret.
+
+The deliverable evidence for this story lives at `src/core/inputs.ts` (loader + matcher), `src/core/surface.ts` (`realVariantFor`, catalog-driven upload actions), `src/core/executor.ts` (`upload_file` catalog branch), `src/dashboard/server.ts` (redaction + provenance fields), `src/dashboard/ui/app.js` (chips), and `src/core/inputs.test.ts` (17 tests covering precedence, ambiguity, env-var resolution, and forbidden-key rejection).
+
 ## Out of scope (deliberate, with one-line reasons)
 
 | Out of scope | Why |

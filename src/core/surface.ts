@@ -19,6 +19,12 @@ import { createHash } from "node:crypto";
 
 import { chromium, type Browser, type Page } from "playwright";
 
+import {
+  matchFileEntry,
+  matchTextEntry,
+  type InputCatalog,
+  type FieldSurface,
+} from "./inputs.js";
 import { waitForInteractableContent } from "./page-utils.js";
 import { type Action, type ActionKind } from "./types.js";
 
@@ -48,7 +54,23 @@ const DEFAULT_SETTLE_TIMEOUT_MS = 5_000;
  * resolved and `<main>` got replaced with the rendered project cards. The
  * settle wait closes that gap.
  */
-export async function mapSurface(targetUrl: string, opts: MapOptions = {}): Promise<Action[]> {
+/**
+ * Map a target's surface into Actions.
+ *
+ * @param targetUrl  URL the browser will navigate to.
+ * @param opts       Mapper options (timeouts).
+ * @param catalog    Optional operator-supplied real-value catalog. When
+ *                   provided, matching entries generate additional Actions:
+ *                   text fields gain a `valid_real_<name>` type variant,
+ *                   and file inputs gain a per-catalog-file upload_file
+ *                   Action alongside the default synthetic png_1x1 fixture.
+ *                   Pass `undefined` (or omit) for the original behavior.
+ */
+export async function mapSurface(
+  targetUrl: string,
+  opts: MapOptions = {},
+  catalog?: InputCatalog,
+): Promise<Action[]> {
   const timeout = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const settleTimeoutMs = opts.settleTimeoutMs ?? DEFAULT_SETTLE_TIMEOUT_MS;
   let browser: Browser | null = null;
@@ -79,13 +101,13 @@ export async function mapSurface(targetUrl: string, opts: MapOptions = {}): Prom
           `Mapping what's there. To wait longer, pass --settle-timeout-ms <ms>.\n`,
       );
     }
-    return await walkPage(page);
+    return await walkPage(page, catalog);
   } finally {
     if (browser) await browser.close();
   }
 }
 
-async function walkPage(page: Page): Promise<Action[]> {
+async function walkPage(page: Page, catalog?: InputCatalog): Promise<Action[]> {
   // Strategy: ask the page itself for the interactable nodes via a single
   // evaluate call (one round-trip, no per-node IPC). The script returns
   // plain serializable records; classification + selector synthesis happen
@@ -175,7 +197,7 @@ async function walkPage(page: Page): Promise<Action[]> {
   `;
   const raw: RawNode[] = (await page.evaluate(browserScript)) as RawNode[];
 
-  return synthesizeActions(raw);
+  return synthesizeActions(raw, catalog);
 }
 
 interface RawNode {
@@ -233,6 +255,20 @@ interface TypeVariant {
   value: string;
   /** One-line human description shown on the dashboard. */
   description: string;
+  /**
+   * When true, the value MUST NOT be surfaced raw on the dashboard or in the
+   * SQLite execution row — it came from an env-referenced catalog entry
+   * (wallet seed, API token, etc.). The executor still types it because
+   * Playwright needs the literal; downstream UI / persistence consult this
+   * flag and redact before display.
+   */
+  sensitive?: boolean;
+  /**
+   * Name of the catalog entry that produced this variant, when applicable.
+   * Surfaced in the dashboard as "via catalog: <name>". Undefined for
+   * synthetic variants.
+   */
+  catalogEntryName?: string;
 }
 
 /**
@@ -249,71 +285,128 @@ interface TypeVariant {
  *   search:   2 (valid, empty)
  *   text:     2 (valid, empty)
  */
-function plausibleValuesFor(node: RawNode): TypeVariant[] {
+/**
+ * Map a RawNode to the FieldSurface shape the catalog matcher consumes.
+ * Kept here (rather than living in inputs.ts) so this surface module owns
+ * the translation from its own crawl shape to the matcher's input.
+ */
+function nodeToFieldSurface(node: RawNode): FieldSurface {
+  return {
+    selector: node.cssPath || undefined,
+    placeholder: node.placeholder ?? undefined,
+    nameAttr: node.nameAttr ?? undefined,
+    idAttr: node.idAttr ?? undefined,
+    ariaLabel: node.name ?? undefined,
+    labelText: node.text ?? undefined,
+  };
+}
+
+function plausibleValuesFor(node: RawNode, catalog?: InputCatalog): TypeVariant[] {
   const t = (node.type ?? "text").toLowerCase();
   const hint = (node.placeholder ?? node.nameAttr ?? node.idAttr ?? "").toLowerCase();
 
+  // Operator-supplied "real" value gets PREPENDED so it leads each
+  // variant set. The synthetic boundary / negative variants still run —
+  // the real value adds a happy-path positive case the synthetic ones
+  // can't satisfy (DMV lookup, VIN decode, server-side validation, etc.).
+  const realPrefix = realVariantFor(node, catalog);
+  const append = (rest: TypeVariant[]): TypeVariant[] =>
+    realPrefix ? [realPrefix, ...rest] : rest;
+
   if (t === "email" || hint.includes("email")) {
-    return [
+    return append([
       { key: "valid", value: "vouch+probe@example.com", description: "well-formed email" },
       { key: "empty", value: "", description: "empty string (tests required-field validation)" },
       { key: "no_at", value: "not-an-email.com", description: "missing '@' (invalid format)" },
       { key: "no_domain", value: "bad@", description: "missing domain after '@' (invalid format)" },
       { key: "whitespace_only", value: "   ", description: "whitespace only (catches trim-not-applied)" },
       { key: "unicode", value: "正常@例え.com", description: "unicode domain + local part" },
-    ];
+    ]);
   }
   if (t === "password" || hint.includes("password")) {
-    return [
+    return append([
       { key: "valid", value: "VouchProbe!2026", description: "meets typical minlength + complexity" },
       { key: "empty", value: "", description: "empty string (tests required-field validation)" },
       { key: "too_short", value: "abc", description: "below typical 8-char minimum" },
       { key: "very_long", value: "x".repeat(200), description: "200 chars (tests maxlength + perf)" },
       { key: "whitespace_only", value: "        ", description: "whitespace only at minlength (catches trim-not-applied)" },
-    ];
+    ]);
   }
   if (t === "number" || hint.includes("age") || hint.includes("count") || hint.includes("number")) {
-    return [
+    return append([
       { key: "positive", value: "42", description: "positive integer" },
       { key: "zero", value: "0", description: "zero (boundary)" },
       { key: "negative", value: "-5", description: "negative integer (some forms reject)" },
       { key: "very_large", value: "999999999999", description: "very large (tests overflow handling)" },
       { key: "decimal", value: "3.14", description: "decimal in an integer field" },
-    ];
+    ]);
   }
   if (t === "url" || hint.includes("url") || hint.includes("link")) {
-    return [
+    return append([
       { key: "valid", value: "https://example.com", description: "well-formed URL" },
       { key: "empty", value: "", description: "empty string" },
       { key: "not_url", value: "just some text", description: "not a URL (tests format validation)" },
       { key: "javascript_proto", value: "javascript:alert(1)", description: "javascript: protocol (tests scheme filtering)" },
-    ];
+    ]);
   }
   if (t === "tel" || hint.includes("phone") || hint.includes("tel")) {
-    return [
+    return append([
       { key: "valid", value: "5551234567", description: "10-digit phone number" },
       { key: "empty", value: "", description: "empty string" },
       { key: "letters", value: "abcdefghij", description: "letters in a tel field (often rejected)" },
-    ];
+    ]);
   }
   if (t === "search" || hint.includes("search")) {
-    return [
+    return append([
       { key: "valid", value: "vouch probe", description: "normal search text" },
       { key: "empty", value: "", description: "empty search" },
       { key: "xss_like", value: "<script>alert('x')</script>", description: "script-injection-looking input (tests output escaping)" },
-    ];
+    ]);
   }
   // Default text / textarea.
-  return [
+  return append([
     { key: "valid", value: "vouch probe text", description: "normal text input" },
     { key: "empty", value: "", description: "empty string" },
     { key: "whitespace_only", value: "   ", description: "whitespace only (catches trim-not-applied)" },
     { key: "unicode", value: "日本語テスト 🚀", description: "unicode + emoji (tests encoding round-trip)" },
     { key: "xss_like", value: "<script>alert('x')</script>", description: "script-injection-looking input (tests output escaping)" },
-  ];
+  ]);
 }
 
-function synthesizeActions(rawNodes: RawNode[]): Action[] {
+/**
+ * Look up an operator-supplied text value for `node` in the catalog and
+ * shape it into a TypeVariant. Returns null when no catalog is supplied
+ * or no entry matches.
+ *
+ * The variant key embeds the catalog entry name so the resulting action id
+ * (e.g. `type__form_input__valid_real_license_plate`) is uniquely
+ * traceable to its source.
+ *
+ * NOTE: when a matched entry is `sensitive` (came from `value_from_env`),
+ * the variant DESCRIPTION names the entry, not the value. Action.type_value
+ * still carries the secret because Playwright needs it to actually type;
+ * callers that persist or display Action.type_value must consult the entry's
+ * `sensitive` flag before doing so. This module's job is to wire — the
+ * dashboard / DB layer owns redaction.
+ */
+function realVariantFor(node: RawNode, catalog?: InputCatalog): TypeVariant | null {
+  if (!catalog || catalog.isEmpty) return null;
+  const match = matchTextEntry(nodeToFieldSurface(node), catalog);
+  if (!match) return null;
+  const entry = match.entry;
+  return {
+    key: `valid_real_${entry.name}`,
+    value: entry.value,
+    description: entry.sensitive
+      ? `operator-supplied value from catalog entry '${entry.name}' (sensitive, redacted)`
+      : `operator-supplied value from catalog entry '${entry.name}'` +
+        (entry.description ? ` — ${entry.description}` : ""),
+    sensitive: entry.sensitive,
+    catalogEntryName: entry.name,
+  };
+}
+
+function synthesizeActions(rawNodes: RawNode[], catalog?: InputCatalog): Action[] {
   const seenSelectors = new Set<string>();
   const out: Action[] = [];
 
@@ -352,7 +445,7 @@ function synthesizeActions(rawNodes: RawNode[]): Action[] {
           name: node.nameAttr,
         },
       });
-      const variants = plausibleValuesFor(node);
+      const variants = plausibleValuesFor(node, catalog);
       for (const v of variants) {
         out.push({
           id: actionIdFromSelector("type", node.cssPath, v.key),
@@ -374,6 +467,11 @@ function synthesizeActions(rawNodes: RawNode[]): Action[] {
             name: node.nameAttr,
             variant_key: v.key,
             variant_description: v.description,
+            // Catalog provenance. Both keys are absent for synthetic
+            // variants. `sensitive: true` is the redact-before-display
+            // signal for the dashboard server.
+            ...(v.catalogEntryName ? { catalog_entry_name: v.catalogEntryName } : {}),
+            ...(v.sensitive ? { sensitive: true } : {}),
           },
         });
       }
@@ -394,6 +492,9 @@ function synthesizeActions(rawNodes: RawNode[]): Action[] {
       // and the depth-2 permutation [click upload-button, upload_file]
       // remains the only viable sequence — which the planner emits
       // naturally without any rule.
+      // Always emit the synthetic png_1x1 fixture upload. This is the
+      // minimum-viable positive case (valid PNG bytes, harmless 1x1) that
+      // works even when no catalog is supplied.
       out.push({
         id: actionIdFromSelector("upload_file", node.cssPath),
         kind: "upload_file",
@@ -408,6 +509,33 @@ function synthesizeActions(rawNodes: RawNode[]): Action[] {
           name: node.nameAttr,
         },
       });
+      // If the operator's catalog has a matching files entry, emit an
+      // ADDITIONAL upload_file action that points at that real file.
+      // This is what lets a target system's face-match / VIN-decode /
+      // doc-type validator actually succeed during a Vouch run.
+      const fileMatch = catalog ? matchFileEntry(nodeToFieldSurface(node), catalog) : null;
+      if (fileMatch) {
+        const entry = fileMatch.entry;
+        out.push({
+          id: actionIdFromSelector("upload_file", node.cssPath, `catalog_${entry.name}`),
+          kind: "upload_file",
+          selector: node.cssPath,
+          description:
+            `Upload operator-supplied file from catalog entry '${entry.name}' into ${description}` +
+            (entry.description ? ` — ${entry.description}` : ""),
+          type_value: null,
+          rules: [],
+          meta: {
+            tag: node.tag,
+            type: "file",
+            fixture_kind: "catalog",
+            catalog_entry_name: entry.name,
+            catalog_absolute_path: entry.absolutePath,
+            catalog_mime: entry.mime,
+            name: node.nameAttr,
+          },
+        });
+      }
       continue;
     }
 

@@ -16,7 +16,7 @@
 // Fresh context per permutation is the constitution's invariant for sequence
 // isolation; reusing a context would let permutation N see state from N-1.
 
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, resolve, join } from "node:path";
 
@@ -719,7 +719,33 @@ async function playStep(
     }
     case "upload_file": {
       if (!action.selector) throw new Error(`upload_file action ${action.id} has no selector`);
-      const fixturePath = ensureUploadFixture(String(action.meta["fixture_kind"] ?? "png_1x1"));
+      const fixtureKind = String(action.meta["fixture_kind"] ?? "png_1x1");
+      // "catalog" kind: the surface mapper resolved an operator-supplied
+      // file from vouch.inputs.yaml and stashed its absolute path in meta.
+      // Anything else falls through to the synthetic fixture materializer.
+      let fixturePath: string;
+      if (fixtureKind === "catalog") {
+        const entryName = action.meta["catalog_entry_name"];
+        const catalogPath = action.meta["catalog_absolute_path"];
+        if (typeof catalogPath !== "string" || catalogPath.length === 0) {
+          throw new Error(
+            `upload_file action ${action.id} has fixture_kind="catalog" but no ` +
+              `catalog_absolute_path in meta. The surface mapper failed to attach ` +
+              `the resolved file path. Re-run \`vouch run\` (which re-maps the ` +
+              `surface) after confirming \`vouch.inputs.yaml\` parses cleanly.`,
+          );
+        }
+        if (!existsSync(catalogPath)) {
+          throw new Error(
+            `upload_file action ${action.id} references catalog file '${entryName ?? "(unknown)"}' ` +
+              `at '${catalogPath}', but that path no longer exists. ` +
+              `Either restore the file or remove the entry from vouch.inputs.yaml.`,
+          );
+        }
+        fixturePath = catalogPath;
+      } else {
+        fixturePath = ensureUploadFixture(fixtureKind);
+      }
       // setInputFiles writes the file to the input directly, bypassing the
       // OS file picker. This is the documented Playwright approach for
       // file-upload tests. The locator timeout reuses the per-step cap so

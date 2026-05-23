@@ -9,6 +9,20 @@
 // The note editor saves on blur via POST /api/predictions/:permId/note and
 // shows a "saved" indicator; failures show inline error text.
 
+// Pulled in as an ES module so we render project.spec_text as actual
+// markdown instead of leaking raw "#" / ">" / "---" into the UI. The CDN
+// ships an ESM build that works without a bundler, matching the rest of
+// this dashboard's build-step-free design.
+import { marked } from 'https://cdn.jsdelivr.net/npm/marked@12.0.0/+esm';
+
+// gfm: tables, task lists, autolinks. breaks: false because spec.md uses
+// real paragraph breaks and we don't want soft line wraps inside them to
+// turn into <br>s. The spec is the user's own file; we accept marked's
+// default behavior of passing HTML through (no sanitizer wired in) because
+// the dashboard is a local-only tool and the spec was written by the
+// operator running it.
+marked.setOptions({ gfm: true, breaks: false });
+
 const $app = document.getElementById('app');
 const $crumb = document.getElementById('breadcrumb');
 
@@ -97,6 +111,42 @@ async function viewProjects() {
   );
 }
 
+// Renders project.spec_text as a markdown panel with a Read more / Read less
+// toggle. Replaces the earlier <pre> that had max-height + overflow-y, which
+// created a scroll-within-scroll fighting the page scroll. The collapsed
+// state uses overflow:hidden + a CSS fade gradient so the cut-off is
+// visually unambiguous without trapping the wheel event.
+function specPanel(specText) {
+  const body = el('div', { class: 'markdown-body' });
+  // marked.parse is synchronous in v12 and returns a string of HTML.
+  // We assign via innerHTML (rather than textContent) because the whole
+  // point is to render the markdown — see comment at the top of this file
+  // for the trust model.
+  body.innerHTML = marked.parse(specText || '');
+
+  const wrap = el('div', { class: 'spec-collapse collapsed' }, [body]);
+  const toggle = el(
+    'button',
+    {
+      class: 'btn btn-spec-toggle mt-3',
+      type: 'button',
+      'aria-expanded': 'false',
+      onclick: () => {
+        const collapsed = wrap.classList.toggle('collapsed');
+        toggle.textContent = collapsed ? 'Read more' : 'Read less';
+        toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      },
+    },
+    'Read more',
+  );
+
+  return el('div', { class: 'panel p-6 mb-6' }, [
+    el('div', { class: 'muted text-sm mb-2' }, 'Spec captured at init (referenced by every run via sha256):'),
+    wrap,
+    toggle,
+  ]);
+}
+
 async function viewProject(projectId) {
   $app.replaceChildren(el('div', { class: 'muted' }, 'Loading runs…'));
   const { project, runs } = await api(`/api/projects/${projectId}/runs`);
@@ -119,10 +169,7 @@ async function viewProject(projectId) {
     el('div', {}, [
       el('h1', { class: 'text-4xl font-bold mb-2' }, project.name),
       project.description ? el('p', { class: 'muted mb-6' }, project.description) : null,
-      el('div', { class: 'panel p-6 mb-6' }, [
-        el('div', { class: 'muted text-sm' }, 'Spec captured at init (referenced by every run via sha256):'),
-        el('pre', { style: 'max-height: 200px; overflow-y: auto; background: var(--panel2); padding: 12px; border-radius: 8px; margin-top: 8px; font-size: 0.8em; white-space: pre-wrap;' }, project.spec_text.slice(0, 1500) + (project.spec_text.length > 1500 ? '\n…(truncated)' : '')),
-      ]),
+      specPanel(project.spec_text),
       el('h2', { class: 'text-2xl font-semibold mb-4' }, `${runs.length} run${runs.length === 1 ? '' : 's'}`),
       el('div', { class: 'space-y-3' },
         runs.map((r) =>

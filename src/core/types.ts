@@ -19,6 +19,11 @@ export const ActionKindSchema = z.enum([
   "toggle_checkbox",
   "select_option", // <select> dropdowns
   "resize_viewport", // global page-level action (no selector)
+  // <input type="file"> upload. Executor populates the input with a small
+  // test fixture (PNG by default) using Playwright's setInputFiles, which
+  // bypasses the OS file dialog. The fixture format / extension lives in
+  // meta.fixture_kind so the executor can pick the right bytes.
+  "upload_file",
 ]);
 export type ActionKind = z.infer<typeof ActionKindSchema>;
 
@@ -126,6 +131,12 @@ export const AnomalyKindSchema = z.enum([
   "http_4xx", // a network request returned 4xx (could be expected, could be a permissions bug)
   "http_5xx", // a network request returned 5xx (almost always a server bug)
   "request_failed", // network request never got a response (CORS, DNS, abort)
+  // Click triggered an async wait (URL change or networkidle settle) longer
+  // than ~500ms with no visible animation, progress indicator, or
+  // [aria-busy] / [role=progressbar] element. Users perceive this as the app
+  // being hung. Pushed by the executor's click handler after watching the
+  // DOM during the settle window.
+  "missing_animation",
 ]);
 export type AnomalyKind = z.infer<typeof AnomalyKindSchema>;
 

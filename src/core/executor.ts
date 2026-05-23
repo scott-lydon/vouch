@@ -16,8 +16,9 @@
 // Fresh context per permutation is the constitution's invariant for sequence
 // isolation; reusing a context would let permutation N see state from N-1.
 
-import { mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, resolve, join } from "node:path";
 
 import { chromium, type Browser, type BrowserContext } from "playwright";
 
@@ -447,7 +448,7 @@ async function executeOneInContext(
     let stepOk = true;
     let stepErr: string | null = null;
     try {
-      await playStep(page, action, activeFocus, stepTimeout);
+      await playStep(page, action, activeFocus, stepTimeout, anomalies);
       if (action.kind === "focus_input") {
         activeFocus = { selector: action.selector ?? "" };
       } else {
@@ -583,6 +584,13 @@ async function playStep(
   action: Action,
   activeFocus: ActiveFocus | null,
   timeout: number,
+  /**
+   * Shared anomaly bucket. The click case pushes a `missing_animation`
+   * anomaly when an async wait completes with no visible progress
+   * indicator. Other cases ignore this argument today but pass through so
+   * future cases (e.g., a select_option that triggers a fetch) can opt in.
+   */
+  anomalies: Anomaly[],
 ): Promise<void> {
   switch (action.kind) {
     case "click": {
@@ -591,26 +599,31 @@ async function playStep(
       // Playwright's load/networkidle events don't always fire for.
       const beforeUrl = page.url();
       await page.locator(action.selector).first().click({ timeout });
-      // Two-phase settle.
-      //
+      // Two-phase settle. See PHASE 1 / PHASE 2 commentary below; same
+      // semantics as before, plus an animation-presence watcher that runs
+      // in parallel with the settle so we can flag "click triggered a wait
+      // with no progress affordance" — the user-reported failure mode the
+      // Sketchy Checker's text-only patterns cannot see.
+      const phase1Cap = 1_500;
+      const phase2Cap = 3_500;
+      const totalCap = phase1Cap + phase2Cap;
+      const clickStart = Date.now();
+
+      // Animation watcher: polls the live DOM in the page context for any
+      // running CSS animation / transition, or any [role=progressbar] /
+      // [aria-busy=true] element. Resolves true the first time anything
+      // is found, or false on timeout. Runs in parallel with the settle
+      // and joins after.
+      const animationWatcher = watchForAnimationDuringWait(page, totalCap);
+      // Suppress unhandled-rejection on the watcher if the wait below
+      // finishes faster than the watcher's max-wait timeout fires.
+      animationWatcher.catch(() => {});
+
       // PHASE 1 (URL change OR load event, cap 1500 ms): the moment we know
       // whether the click triggered any navigation. For a click that does
       // nothing (button that toggles a local state, dropdown, no-op),
-      // neither URL nor load will fire; the 1500 ms cap then expires and we
-      // proceed without stalling the run.
-      //
-      // PHASE 2 (networkidle, cap 3500 ms, ONLY if URL changed): the gap
-      // Vouch's 2026-05-22 depth-2 run against Meridian's deployed frontend
-      // surfaced. SPAs (Next.js <Link>, react-router) flip the URL
-      // synchronously via History.pushState but the new route then fires its
-      // own data fetches (Solana RPC, REST, etc.) that take 2-5 s to settle.
-      // Reading observed_post_state in that window catches loading skeletons
-      // / "Loading on-chain markets..." copy instead of the destination
-      // content the Oracle predicted, which trips the verifier as a false
-      // positive bug candidate. We only pay this second wait when a route
-      // change actually happened — no-op clicks don't compound.
-      const phase1Cap = 1_500;
-      const phase2Cap = 3_500;
+      // neither URL nor load will fire; the 1500 ms cap then expires and
+      // we proceed without stalling the run.
       await Promise.race([
         page.waitForLoadState("load", { timeout: phase1Cap }).catch(() => {}),
         page
@@ -621,8 +634,41 @@ async function playStep(
           )
           .catch(() => {}),
       ]);
+      // PHASE 2 (networkidle, cap 3500 ms, ONLY if URL changed): SPAs flip
+      // the URL synchronously via History.pushState but the new route then
+      // fires its own data fetches that can take 2-5 s to settle. Reading
+      // observed_post_state in that window would catch loading skeletons
+      // instead of the destination content. We only pay this second wait
+      // when a route change actually happened.
       if (page.url() !== beforeUrl) {
         await page.waitForLoadState("networkidle", { timeout: phase2Cap }).catch(() => {});
+      }
+
+      // Join the animation watcher. If the settle finished quickly the
+      // watcher may still be running; we resolve it now so it doesn't
+      // outlive the step. The watcher's internal timeout protects us if
+      // the page side never returns (force-closed context, etc.).
+      const animationDetected = await animationWatcher.catch(() => false);
+      const elapsed = Date.now() - clickStart;
+      // Flag the missing_animation anomaly only when the wait was long
+      // enough to feel like a stall. 500ms is below human perception
+      // of "I'm waiting" for most users and avoids noise on instant
+      // clicks. Tunable via VOUCH_ANIM_FLAG_MS if a SUT needs different
+      // sensitivity, but the default catches the "feels hung" cases
+      // without false-flagging snappy interactions.
+      const flagThresholdMs = Number(process.env.VOUCH_ANIM_FLAG_MS ?? 500);
+      if (elapsed >= flagThresholdMs && !animationDetected) {
+        anomalies.push({
+          kind: "missing_animation",
+          message:
+            `Click on ${action.id} triggered a ${elapsed}ms wait with no CSS animation, transition, ` +
+            `[role=progressbar], or [aria-busy=true] element observed during the wait. ` +
+            `Users perceive this as the app being hung; consider adding a progress affordance ` +
+            `or a loading skeleton. Threshold ${flagThresholdMs}ms (override with VOUCH_ANIM_FLAG_MS).`,
+          url: null,
+          status: null,
+          at: new Date().toISOString(),
+        });
       }
       return;
     }
@@ -671,7 +717,129 @@ async function playStep(
       await page.setViewportSize({ width: w, height: h });
       return;
     }
+    case "upload_file": {
+      if (!action.selector) throw new Error(`upload_file action ${action.id} has no selector`);
+      const fixturePath = ensureUploadFixture(String(action.meta["fixture_kind"] ?? "png_1x1"));
+      // setInputFiles writes the file to the input directly, bypassing the
+      // OS file picker. This is the documented Playwright approach for
+      // file-upload tests. The locator timeout reuses the per-step cap so
+      // an upload stalled on a hidden / detached input fails with the same
+      // diagnostic shape as any other interaction.
+      await page.locator(action.selector).first().setInputFiles(fixturePath, { timeout });
+      return;
+    }
   }
+}
+
+/**
+ * Ensure a tiny test-fixture file exists on disk and return its absolute
+ * path. We materialize the fixture lazily into the OS temp dir so the
+ * repo doesn't have to carry binary blobs and so multiple Vouch processes
+ * can share the same file. Kinds supported:
+ *
+ *   - "png_1x1": a 67-byte valid PNG (1x1 transparent). Safe minimum: most
+ *     SUT validators accept any PNG byte signature, and 1x1 keeps uploads
+ *     well below any reasonable size limit.
+ *
+ * Add new fixture kinds here when a real SUT needs them (PDF, HEIF, etc.).
+ * Each kind should fail loudly with a clear unknown-kind error rather than
+ * silently defaulting, so a typo in surface-mapper meta surfaces fast.
+ */
+function ensureUploadFixture(kind: string): string {
+  if (kind !== "png_1x1") {
+    throw new Error(
+      `executor: unknown upload fixture kind '${kind}'. Supported kinds: png_1x1. ` +
+        `Add new kinds in ensureUploadFixture() in executor.ts when a real SUT requires them.`,
+    );
+  }
+  // 67-byte 1x1 transparent PNG. Decoded from the canonical base64
+  // representation that browser developer tools emit for a blank pixel.
+  const PNG_1x1_BASE64 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+  const path = join(tmpdir(), "vouch-fixture-1x1.png");
+  // Idempotent write. Best-effort: if the temp dir is unwritable, surface
+  // a clear error so the operator knows where to look.
+  try {
+    writeFileSync(path, Buffer.from(PNG_1x1_BASE64, "base64"));
+  } catch (err) {
+    throw new Error(
+      `executor: could not materialize upload fixture at '${path}'. ` +
+        `The OS temp dir is unwritable. ` +
+        `Inner error: ${(err as Error).message}`,
+    );
+  }
+  return path;
+}
+
+/**
+ * Watch the page DOM for ANY visible animation, transition, or progress
+ * affordance during a wait window. Runs entirely inside the browser context
+ * via a single page.evaluate that returns a Promise, so we are not paying
+ * per-poll IPC.
+ *
+ * Returns:
+ *   - `true` as soon as ANY of these is observed:
+ *     - any element with a computed animation-name !== "none" AND
+ *       animation-duration > 0s
+ *     - any element with a transition-property !== "none" AND
+ *       transition-duration > 0s
+ *     - any [role=progressbar]
+ *     - any [aria-busy=true]
+ *   - `false` if the maxWaitMs elapses without observing any of the above.
+ *
+ * Failure modes deliberately suppressed: if the page is force-closed mid
+ * watcher (per-perm cap fires, context.close), the evaluate throws and we
+ * resolve to `false` from the caller's `.catch(() => false)`. We treat
+ * "we couldn't observe" the same as "we didn't observe an animation"
+ * because the caller's downstream effect (push anomaly) is gated on the
+ * elapsed time also exceeding the threshold; a force-closed step is the
+ * least likely to fall in the missing_animation case.
+ */
+function watchForAnimationDuringWait(
+  page: import("playwright").Page,
+  maxWaitMs: number,
+): Promise<boolean> {
+  // Pass the script as a STRING (not a typed arrow) for the same
+  // tsx-transpiler reason walkPage documents: tsx-injected __name helpers
+  // don't exist in the page runtime. Keeping the script as a string keeps
+  // the build-target migration safe for both `tsx` and `tsc`.
+  const browserScript = `
+    (maxMs) => new Promise((resolve) => {
+      const hasAnyAnimation = () => {
+        if (document.querySelector('[role="progressbar"], [aria-busy="true"]')) return true;
+        const els = document.querySelectorAll('*');
+        for (const el of els) {
+          const cs = window.getComputedStyle(el);
+          if (cs.animationName && cs.animationName !== 'none' && cs.animationDuration !== '0s') return true;
+          if (cs.transitionProperty && cs.transitionProperty !== 'none' && cs.transitionDuration !== '0s') return true;
+        }
+        return false;
+      };
+      if (hasAnyAnimation()) { resolve(true); return; }
+      // Poll every 100ms. Cheap relative to the wait itself; if a real
+      // loading state appears during the wait we will see it.
+      let resolved = false;
+      const interval = setInterval(() => {
+        if (resolved) return;
+        if (hasAnyAnimation()) {
+          resolved = true;
+          clearInterval(interval);
+          clearTimeout(t);
+          resolve(true);
+        }
+      }, 100);
+      const t = setTimeout(() => {
+        if (resolved) return;
+        resolved = true;
+        clearInterval(interval);
+        resolve(false);
+      }, maxMs);
+    })
+  `;
+  // page.evaluate accepts (fn, arg). When fn is a string we still pass the
+  // arg as the second positional. Playwright evals the string and applies
+  // the arg.
+  return page.evaluate(browserScript, maxWaitMs) as Promise<boolean>;
 }
 
 /**

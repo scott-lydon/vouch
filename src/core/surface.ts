@@ -121,7 +121,7 @@ async function walkPage(page: Page): Promise<Action[]> {
         if (t === "a" && el.href) return true;
         if (t === "input") {
           const type = (el.type || "text").toLowerCase();
-          return ["text", "email", "password", "search", "url", "tel", "number", "checkbox", "radio"].includes(type);
+          return ["text", "email", "password", "search", "url", "tel", "number", "checkbox", "radio", "file"].includes(type);
         }
         const role = el.getAttribute("role");
         if (role && ["button", "link", "checkbox", "radio", "menuitem", "tab"].includes(role)) return true;
@@ -377,6 +377,37 @@ function synthesizeActions(rawNodes: RawNode[]): Action[] {
           },
         });
       }
+      continue;
+    }
+
+    if (node.tag === "input" && (node.type ?? "").toLowerCase() === "file") {
+      // <input type="file"> upload. We do NOT add a focus_input + type pair
+      // here — the OS file picker isn't reachable via Playwright's text
+      // input model, and `setInputFiles` populates the input directly. We
+      // also do NOT impose a rule that requires a prior click on a label /
+      // upload button: many SUTs wire the visible button to a hidden file
+      // input via a `<label>` association, and Vouch's executor can drive
+      // the hidden input straight without a label tap. If a future SUT
+      // genuinely requires the prior click (e.g. opens a modal that
+      // injects the input on demand), the surface-mapper sees that case
+      // because the file input simply isn't present until after the click,
+      // and the depth-2 permutation [click upload-button, upload_file]
+      // remains the only viable sequence — which the planner emits
+      // naturally without any rule.
+      out.push({
+        id: actionIdFromSelector("upload_file", node.cssPath),
+        kind: "upload_file",
+        selector: node.cssPath,
+        description: `Upload a PNG test fixture into ${description}`,
+        type_value: null,
+        rules: [],
+        meta: {
+          tag: node.tag,
+          type: "file",
+          fixture_kind: "png_1x1",
+          name: node.nameAttr,
+        },
+      });
       continue;
     }
 

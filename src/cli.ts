@@ -38,6 +38,7 @@ import {
 } from "./core/expectation.js";
 import { analyzeRun, cleanCleanRunScreenshots, renderFindingsMarkdown } from "./core/findings.js";
 import { generatePermutationsWithStats } from "./core/permutations.js";
+import { sequenceKey } from "./core/sequences.js";
 import { mapSurface } from "./core/surface.js";
 import {
   finalizeRun,
@@ -54,6 +55,7 @@ import {
   insertRun,
   listActionsForRun,
   listActiveBlockedPrefixes,
+  listActiveBlockedPrefixesAtDepth,
   listAllBlockedPrefixes,
   listPermutationsForRun,
   listRunsForProject,
@@ -183,6 +185,26 @@ interface RunOneDepthInputs {
   verifySource: PredictionSource;
   /** Capture per-step PNG screenshots; cleaned up on clean permutations. */
   screenshots: boolean;
+  /**
+   * When true, look up the active blocked sequences at THIS depth for the
+   * project (sequences that previously crashed or mismatched and got
+   * recorded). Re-execute them BEFORE running the rest of the depth's plan.
+   * If they all now pass, auto-unblock them and continue with the rest. If
+   * any still fail, write the report and stop (do not run the remainder).
+   *
+   * Why: today, after a finding at depth N, the prefix is recorded and the
+   * next campaign rerun's planner FILTERS that sequence out of the plan. The
+   * user has to call `vouch unblock` manually to even retest the fix. With
+   * this flag on, the retest happens automatically on every campaign rerun
+   * of the same depth, and the rest of the depth is gated on those fixes
+   * landing. Saves both LLM cost (skip the rest until the broken set goes
+   * green) and operator overhead (no manual unblock step).
+   *
+   * Off for `vouch run` (single-shot, explicit user intent preserved) and
+   * `vouch resume` (re-execute the same run's existing perm rows; no
+   * re-planning happens there). On for `vouch campaign`.
+   */
+  retestPreviouslyBroken: boolean;
 }
 
 /**
@@ -193,10 +215,14 @@ interface RunOneDepthInputs {
  * Pipeline:
  *   1. mapSurface — discover actions on the target.
  *   2. generatePermutations — depth-N sequences with rule filtering.
- *   3. predictOne per permutation — Oracle writes expected_post_state.
- *   4. executePermutations — Playwright replays each in a fresh context.
- *   5. verifyExpectation per permutation (if verify=true) — LLM diff.
- *   6. finalizeRun — writes finished_at on the runs row.
+ *   3. If `retestPreviouslyBroken`: split perms into two phases —
+ *      previously-broken-at-this-depth sequences first, the rest gated on
+ *      those going green. Auto-unblock the priority set if it now passes.
+ *      Otherwise: run all perms in one phase (current behavior).
+ *   4. Per phase: predictOne (Oracle) → executePermutations (Playwright in a
+ *      fresh context per perm) → verifyExpectation (LLM diff, if enabled).
+ *   5. finalizeRun — writes finished_at on the runs row. Called exactly
+ *      once, even when the priority phase short-circuits the remainder.
  */
 async function runOneDepth(input: RunOneDepthInputs): Promise<string> {
   const { db, project, targetUrl, depth, maxSeq, oracleSource, verify, verifySource } = input;
@@ -222,40 +248,159 @@ async function runOneDepth(input: RunOneDepthInputs): Promise<string> {
   insertActions(db, runId, actions);
   process.stdout.write(`[depth ${depth}] discovered ${actions.length} actions\n`);
 
+  // ---- Retest plan ----
+  // Active blocked prefixes for this project. When retestPreviouslyBroken is
+  // on, we split them: the ones at THIS depth's length become the "retest
+  // set" (we want the planner to re-emit them, then we execute them first).
+  // The rest stay as the deeper-depth filter (e.g., a length-2 block still
+  // filters length-3 perms — we are not retesting fragments here).
   const activeBlocks = listActiveBlockedPrefixes(db, project.id);
-  const blockedPrefixes = activeBlocks.map((b) => b.prefix);
+  const retestBlocks: typeof activeBlocks = input.retestPreviouslyBroken
+    ? activeBlocks.filter((b) => b.prefix.length === depth)
+    : [];
+  const retestSequenceKeys = new Set(retestBlocks.map((b) => sequenceKey(b.prefix)));
+  const filterBlocks = activeBlocks.filter((b) => !retestSequenceKeys.has(sequenceKey(b.prefix)));
+
   const planResult = generatePermutationsWithStats(runId, actions, {
     depth,
     maxSequences: maxSeq,
-    blockedPrefixes,
+    blockedPrefixes: filterBlocks.map((b) => b.prefix),
   });
   const perms = planResult.permutations;
   insertPermutations(db, perms);
   process.stdout.write(
     `[depth ${depth}] generated ${perms.length} permutations (depth=${depth}, after rule filtering)` +
-      (activeBlocks.length > 0
-        ? ` and skipped ${planResult.blocked_skip_count} via ${activeBlocks.length} active blocked prefix${activeBlocks.length === 1 ? "" : "es"}`
+      (filterBlocks.length > 0
+        ? ` and skipped ${planResult.blocked_skip_count} via ${filterBlocks.length} active blocked prefix${filterBlocks.length === 1 ? "" : "es"}`
+        : ``) +
+      (retestBlocks.length > 0
+        ? ` (re-included ${retestBlocks.length} previously-broken sequence${retestBlocks.length === 1 ? "" : "s"} for retest)`
         : ``) +
       `\n`,
   );
 
+  // Partition perms into "priority" (matches one of the retest sequences) and
+  // "rest". Match is on action_ids equality, not perm_id, because perm_ids
+  // change on every run.
+  const priorityPerms = perms.filter((p) => retestSequenceKeys.has(sequenceKey(p.action_ids)));
+  const restPerms = perms.filter((p) => !retestSequenceKeys.has(sequenceKey(p.action_ids)));
+
   const actionsById = new Map(actions.map((a) => [a.id, a]));
-  await runMissingPhases({
-    db,
-    project,
-    actions,
-    actionsById,
-    perms,
-    targetUrl,
-    depth,
-    runId,
-    oracleSource,
-    verify,
-    verifySource,
-    screenshots: input.screenshots,
-    logPrefix: `[depth ${depth}]`,
-  });
+
+  // ---- Phase 1: retest the previously-broken sequences (if any). ----
+  if (priorityPerms.length > 0) {
+    process.stdout.write(
+      `[depth ${depth}] retest phase: re-executing ${priorityPerms.length} previously-broken sequence${priorityPerms.length === 1 ? "" : "s"} before the rest of the depth.\n`,
+    );
+    await runMissingPhases({
+      db,
+      project,
+      actions,
+      actionsById,
+      perms: priorityPerms,
+      targetUrl,
+      depth,
+      runId,
+      oracleSource,
+      verify,
+      verifySource,
+      screenshots: input.screenshots,
+      logPrefix: `[depth ${depth} retest]`,
+    });
+
+    const priorityIds = new Set(priorityPerms.map((p) => p.id));
+    const priorityClean = analyzeRunForPerms(db, runId, priorityIds);
+    if (priorityClean.blocking_count > 0) {
+      // The fix didn't fully land. Don't burn the rest of the depth's budget;
+      // surface the still-broken set and stop. The campaign loop's prompt
+      // ("press Enter to re-run") brings the user back here after another
+      // fix attempt.
+      process.stdout.write(
+        `[depth ${depth}] retest phase: ${priorityClean.blocking_count} of ${priorityPerms.length} previously-broken sequence${priorityPerms.length === 1 ? " is" : "s are"} still failing. Skipping the remaining ${restPerms.length} perm${restPerms.length === 1 ? "" : "s"} at this depth until those clear.\n`,
+      );
+      finalizeRun(db, runId, nowIso());
+      maybeCleanupScreenshots(input.screenshots, db, runId, `[depth ${depth} retest]`);
+      return runId;
+    }
+
+    // Priority set is clean. Auto-unblock the prefixes so deeper depths can
+    // also re-test the now-fixed start sequences in the next campaign
+    // iteration. Log each one so the operator can audit.
+    for (const block of retestBlocks) {
+      const ok = unblockPrefixById(db, block.id);
+      if (ok) {
+        process.stdout.write(
+          `[depth ${depth}] retest phase: auto-unblocked #${block.id} (prefix=${JSON.stringify(block.prefix)}) because it now passes.\n`,
+        );
+      }
+    }
+    process.stdout.write(
+      `[depth ${depth}] retest phase clean. Running the remaining ${restPerms.length} perm${restPerms.length === 1 ? "" : "s"}.\n`,
+    );
+  }
+
+  // ---- Phase 2: the rest of the depth (or the only phase, on first run). ----
+  if (restPerms.length > 0) {
+    await runMissingPhases({
+      db,
+      project,
+      actions,
+      actionsById,
+      perms: restPerms,
+      targetUrl,
+      depth,
+      runId,
+      oracleSource,
+      verify,
+      verifySource,
+      screenshots: input.screenshots,
+      logPrefix: `[depth ${depth}]`,
+    });
+  }
+
+  finalizeRun(db, runId, nowIso());
+  maybeCleanupScreenshots(input.screenshots, db, runId, `[depth ${depth}]`);
   return runId;
+}
+
+
+/**
+ * Filtered version of analyzeRun: returns the blocking and warning counts
+ * restricted to the supplied permutation ids. Used by the retest phase to
+ * decide "is the priority subset clean?" without conflating it with not-yet-
+ * executed remainder perms.
+ */
+function analyzeRunForPerms(
+  db: ReturnType<typeof openDB>,
+  runId: string,
+  permIds: Set<string>,
+): { blocking_count: number; warning_count: number } {
+  const full = analyzeRun(db, runId);
+  let blocking = 0;
+  let warning = 0;
+  for (const f of full.findings) {
+    if (!permIds.has(f.permutation_id)) continue;
+    if (f.severity === "blocking") blocking++;
+    else if (f.severity === "warning") warning++;
+  }
+  return { blocking_count: blocking, warning_count: warning };
+}
+
+/**
+ * Encapsulates the existing "delete screenshot dirs for clean perms" cleanup
+ * so we can call it from BOTH the early-return short-circuit path (retest
+ * phase still broken) and the normal-completion path, without duplicating
+ * the conditional.
+ */
+function maybeCleanupScreenshots(
+  enabled: boolean,
+  db: ReturnType<typeof openDB>,
+  runId: string,
+  logPrefix: string,
+): void {
+  if (!enabled) return;
+  const deleted = cleanCleanRunScreenshots(db, runId);
+  process.stdout.write(`${logPrefix} screenshots: kept evidence on findings, deleted ${deleted} clean perm dirs\n`);
 }
 
 // ============================================================================
@@ -494,15 +639,12 @@ async function runMissingPhases(input: RunMissingPhasesInputs): Promise<void> {
     process.stdout.write(`${logPrefix} verify done (cost ~$${verifyCost.toFixed(4)})\n`);
   }
 
-  finalizeRun(db, runId, nowIso());
-
-  // Screenshot cleanup: delete dirs for permutations that produced zero
-  // blocking findings. Keeps disk usage bounded; preserves evidence for the
-  // ones that matter.
-  if (input.screenshots) {
-    const deleted = cleanCleanRunScreenshots(db, runId);
-    process.stdout.write(`${logPrefix} screenshots: kept evidence on findings, deleted ${deleted} clean perm dirs\n`);
-  }
+  // finalizeRun + screenshot cleanup intentionally live in the orchestrator
+  // (`runOneDepth`) and in `vouch resume`. runOneDepth can invoke this helper
+  // TWICE in one run (retest phase, then remainder), so finalizing here would
+  // mark the run finished after only the first phase and break the
+  // partial-completion accounting in `vouch campaign`. `input.screenshots` is
+  // still used above to decide screenshot capture per perm.
 }
 
 // ----- run (umbrella) -----
@@ -563,6 +705,12 @@ program
         verify: !!opts.verify,
         verifySource: source,
         screenshots: opts.screenshots !== false,
+        // `vouch run` is single-shot and explicit. If the user typed
+        // `vouch run --depth N` with stale blocked prefixes in the DB, we
+        // preserve the existing semantics: skip the blocked sequences and
+        // run only the remainder. `vouch campaign` is the place that wants
+        // the retest dance.
+        retestPreviouslyBroken: false,
       });
       process.stdout.write(
         `[vouch/run ${runId}] view at:  vouch serve  → http://localhost:7321/#/run/${runId}\n`,
@@ -688,6 +836,12 @@ program
               verify: opts.verify,
               verifySource,
               screenshots: opts.screenshots !== false,
+              // Broken-first scheduling: on every iteration of the campaign
+              // loop, re-execute the sequences that previously crashed or
+              // mismatched at THIS depth, BEFORE running the remainder.
+              // Gates the remainder on those going green, auto-unblocks them
+              // when they do.
+              retestPreviouslyBroken: true,
             });
 
             const report = analyzeRun(db, runId);
@@ -892,6 +1046,12 @@ program
         screenshots: opts.screenshots !== false,
         logPrefix: `[resume ${run.id.split("_").pop()}]`,
       });
+      // runMissingPhases used to finalize + cleanup itself; that responsibility
+      // moved to the orchestrator when broken-first scheduling landed (so
+      // runOneDepth can call runMissingPhases twice without finalizing twice).
+      // Resume now owns these two calls explicitly.
+      finalizeRun(db, run.id, nowIso());
+      maybeCleanupScreenshots(opts.screenshots !== false, db, run.id, `[resume ${run.id.split("_").pop()}]`);
       process.stdout.write(`\n=== Resume complete ===\n  view at: http://localhost:7321/#/run/${run.id}\n`);
     },
   );

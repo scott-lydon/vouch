@@ -113,6 +113,35 @@ export const VerdictSchema = z.enum([
 ]);
 export type Verdict = z.infer<typeof VerdictSchema>;
 
+/**
+ * One sketchy thing observed while a permutation ran. Separate from step_log
+ * because anomalies can arise asynchronously (a console.error logged 200ms
+ * after the click that triggered it; a 500 response from a background fetch).
+ * Surfaces in the dashboard as the YELLOW tier: not a step failure, but
+ * worth a second look.
+ */
+export const AnomalyKindSchema = z.enum([
+  "console_error", // page emitted a console.error (JS error or explicit log)
+  "page_error", // uncaught exception bubbled to the page (window.onerror)
+  "http_4xx", // a network request returned 4xx (could be expected, could be a permissions bug)
+  "http_5xx", // a network request returned 5xx (almost always a server bug)
+  "request_failed", // network request never got a response (CORS, DNS, abort)
+]);
+export type AnomalyKind = z.infer<typeof AnomalyKindSchema>;
+
+export const AnomalySchema = z.object({
+  kind: AnomalyKindSchema,
+  /** Short human-readable summary. */
+  message: z.string(),
+  /** URL involved (http_4xx, http_5xx, or request_failed kinds), else null. */
+  url: z.string().nullable().default(null),
+  /** HTTP status code for http_4xx and http_5xx kinds, else null. */
+  status: z.number().int().nullable().default(null),
+  /** Wall-clock ISO timestamp the anomaly fired. */
+  at: z.string(),
+});
+export type Anomaly = z.infer<typeof AnomalySchema>;
+
 export const ExecutionSchema = z.object({
   permutation_id: z.string(),
   verdict: VerdictSchema,
@@ -136,6 +165,13 @@ export const ExecutionSchema = z.object({
       screenshot_path: z.string().nullable().default(null),
     }),
   ),
+  /**
+   * Browser-emitted anomalies captured during the permutation: console errors,
+   * page exceptions, 4xx/5xx network responses, failed requests. An empty
+   * array means a clean run. Non-empty means the dashboard should consider
+   * the YELLOW tier even when the verdict is pass / observed matches expected.
+   */
+  anomalies: z.array(AnomalySchema).default([]),
   observed_post_state: z.string(),
   started_at: z.string(),
   finished_at: z.string(),

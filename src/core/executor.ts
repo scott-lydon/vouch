@@ -22,7 +22,13 @@ import { dirname, resolve } from "node:path";
 import { chromium, type Browser, type BrowserContext } from "playwright";
 
 import { waitForInteractableContent } from "./page-utils.js";
-import { type Action, type Execution, type Permutation, type Verdict } from "./types.js";
+import {
+  type Action,
+  type Anomaly,
+  type Execution,
+  type Permutation,
+  type Verdict,
+} from "./types.js";
 
 /**
  * Thrown by the executor for failures that are not a single permutation's
@@ -240,6 +246,7 @@ async function executeOneCapped(
       permutation_id: perm.id,
       verdict: "infrastructure_error",
       step_log: [],
+      anomalies: [],
       observed_post_state:
         `browser.newContext() failed before any step ran: ${(err as Error).message ?? String(err)}. ` +
         `If this recurs across many perms, the chromium process likely crashed mid-run; abort and rerun vouch.`,
@@ -252,6 +259,17 @@ async function executeOneCapped(
   let timedOut = false;
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
 
+  // Shared step log so the timeout path can snapshot partial evidence.
+  // Without this the timeout Execution shipped step_log: [] (qa-adversary
+  // Finding 3, 2026-05-22): a depth-5 perm that stalled on step 5 would
+  // ship zero step evidence, hiding which earlier step was the actual
+  // problem from the dashboard.
+  const sharedStepLog: Execution["step_log"] = [];
+  // Same pattern for anomalies (yellow-tier evidence): a perm that hangs
+  // is often hanging because of a console error or a 500 response, so the
+  // anomaly list is exactly what the operator needs to see.
+  const sharedAnomalies: Anomaly[] = [];
+
   const work = executeOneInContext(
     ctx,
     perm,
@@ -261,6 +279,8 @@ async function executeOneCapped(
     navTimeout,
     screenshotsDir,
     startedAt,
+    sharedStepLog,
+    sharedAnomalies,
   );
   // Suppress an unhandled-rejection log if work loses the race to the cap.
   // The timeout path resolves with a synthetic Execution; the work promise
@@ -273,12 +293,20 @@ async function executeOneCapped(
       // Best-effort force-close. If close itself stalls, that's a Playwright
       // bug we can't paper over here, but we already have a verdict.
       ctx.close().catch(() => {});
+      // Snapshot whatever steps ran before the cap fired. We slice() so the
+      // returned Execution holds a frozen copy; the still-running work
+      // promise may keep pushing to sharedStepLog briefly before its
+      // Playwright calls start throwing from the force-closed context.
+      const partialSteps = sharedStepLog.slice();
+      const partialAnomalies = sharedAnomalies.slice();
       resolve({
         permutation_id: perm.id,
         verdict: "timeout",
-        step_log: [],
+        step_log: partialSteps,
+        anomalies: partialAnomalies,
         observed_post_state:
-          `Permutation exceeded the per-permutation wallclock cap of ${permTimeoutMs}ms. ` +
+          `Permutation exceeded the per-permutation wallclock cap of ${permTimeoutMs}ms ` +
+          `after completing ${partialSteps.length} of ${perm.action_ids.length} steps. ` +
           `The browser context was force-closed and the run continued. ` +
           `If this recurs: ` +
           `(1) Raise opts.permTimeoutMs or env VOUCH_PERM_TIMEOUT_MS. ` +
@@ -311,8 +339,20 @@ async function executeOneInContext(
   navTimeout: number,
   screenshotsDir: string | null,
   startedAt: string,
+  /**
+   * Step log owned by the caller (executeOneCapped). We push to it as steps
+   * run so that if the per-perm cap fires mid-permutation, the caller can
+   * snapshot whatever ran before the cap. Aliasing the array (not copying)
+   * is the point: a local-only log would be unreachable from the cap path.
+   */
+  stepLog: Execution["step_log"],
+  /**
+   * Anomaly bucket owned by the caller. Console errors, page errors, and
+   * failed HTTP responses get pushed here as they happen. Same aliasing
+   * rationale as stepLog: the cap path snapshots this on timeout.
+   */
+  anomalies: Anomaly[],
 ): Promise<Execution> {
-  const stepLog: Execution["step_log"] = [];
   let verdict: Verdict = "pass";
   let errorClass: string | null = null;
   let observedPostState = "";
@@ -320,6 +360,13 @@ async function executeOneInContext(
   // ctx is owned by executeOneCapped (the wrapper) so this function does NOT
   // close it. The wrapper closes it on both the normal and timeout paths.
   const page = await ctx.newPage();
+
+  // Anomaly listeners — wired BEFORE goto so we capture issues fired during
+  // the initial page load. Playwright invokes these asynchronously, so a
+  // 500 response or console.error logged 300ms after a click can still
+  // land on the right Execution row.
+  attachAnomalyListeners(page, anomalies, targetUrl);
+
   try {
     await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: navTimeout });
   } catch (err) {
@@ -331,6 +378,7 @@ async function executeOneInContext(
       permutation_id: perm.id,
       verdict,
       step_log: stepLog,
+      anomalies,
       observed_post_state: observedPostState,
       started_at: startedAt,
       finished_at: finishedAt,
@@ -405,11 +453,102 @@ async function executeOneInContext(
     permutation_id: perm.id,
     verdict,
     step_log: stepLog,
+    anomalies,
     observed_post_state: observedPostState,
     started_at: startedAt,
     finished_at: finishedAt,
     error_class: errorClass,
   };
+}
+
+/**
+ * Attach Playwright event listeners that collect browser-side anomalies into
+ * the caller's shared bucket. We listen for:
+ *
+ *   - `console.error` messages: any JS error or explicit error log, which
+ *     usually means a real bug somewhere in the page even if the click-walk
+ *     itself succeeded.
+ *   - `pageerror` events: uncaught exceptions bubbled to the page. The
+ *     stronger signal than console.error because nothing handled them.
+ *   - `response` with HTTP 4xx or 5xx: a backend call that didn't go well.
+ *     We filter to responses from the SUT's own origin to avoid noise from
+ *     analytics pixels or third-party trackers.
+ *   - `requestfailed`: a network request that never produced a response
+ *     (CORS, DNS, abort). Same origin filter.
+ *
+ * Why not feed these into the step_log: the events fire asynchronously and
+ * may not line up with any specific step (a setTimeout-triggered fetch
+ * could fail 500ms after the step that scheduled it). The anomaly bucket
+ * is the correct home for these.
+ *
+ * Why the same-origin filter on responses: a third-party tracker returning
+ * 404 is not a SUT bug, but the operator would have to triage every
+ * analytics pixel if we didn't filter. We match by URL origin (everything
+ * before the path) instead of substring so a SUT at `example.com/app` does
+ * not accidentally include `subdomain.example.com/tracker`.
+ */
+function attachAnomalyListeners(
+  page: import("playwright").Page,
+  anomalies: Anomaly[],
+  targetUrl: string,
+): void {
+  let targetOrigin: string;
+  try {
+    targetOrigin = new URL(targetUrl).origin;
+  } catch {
+    // If the target URL is not parseable, fall back to capturing everything.
+    // The clearer-error path: surface unparseable target as a setup bug
+    // rather than silently filtering nothing.
+    targetOrigin = "";
+  }
+
+  page.on("console", (msg) => {
+    if (msg.type() !== "error") return;
+    anomalies.push({
+      kind: "console_error",
+      message: msg.text().slice(0, 500),
+      url: msg.location().url || null,
+      status: null,
+      at: new Date().toISOString(),
+    });
+  });
+
+  page.on("pageerror", (err) => {
+    anomalies.push({
+      kind: "page_error",
+      message: (err.message || String(err)).slice(0, 500),
+      url: null,
+      status: null,
+      at: new Date().toISOString(),
+    });
+  });
+
+  page.on("response", (resp) => {
+    const status = resp.status();
+    if (status < 400) return;
+    const url = resp.url();
+    if (targetOrigin && !url.startsWith(targetOrigin)) return;
+    anomalies.push({
+      kind: status >= 500 ? "http_5xx" : "http_4xx",
+      message: `${resp.request().method()} ${url} -> ${status} ${resp.statusText()}`,
+      url,
+      status,
+      at: new Date().toISOString(),
+    });
+  });
+
+  page.on("requestfailed", (req) => {
+    const url = req.url();
+    if (targetOrigin && !url.startsWith(targetOrigin)) return;
+    const failure = req.failure();
+    anomalies.push({
+      kind: "request_failed",
+      message: `${req.method()} ${url} -> ${failure?.errorText ?? "unknown failure"}`,
+      url,
+      status: null,
+      at: new Date().toISOString(),
+    });
+  });
 }
 
 async function playStep(

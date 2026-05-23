@@ -103,6 +103,7 @@ function applyMigrations(raw: Database.Database): void {
       permutation_id      TEXT PRIMARY KEY REFERENCES permutations(id) ON DELETE CASCADE,
       verdict             TEXT NOT NULL,
       step_log_json       TEXT NOT NULL,
+      anomalies_json      TEXT NOT NULL DEFAULT '[]',
       observed_post_state TEXT NOT NULL,
       started_at          TEXT NOT NULL,
       finished_at         TEXT NOT NULL,
@@ -144,6 +145,20 @@ function applyMigrations(raw: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_blocked_project_active
       ON blocked_prefixes(project_id, unblocked_at);
   `);
+
+  // Additive migration: add `anomalies_json` to executions on databases
+  // that pre-date the yellow-tier feature. SQLite has no IF NOT EXISTS for
+  // ADD COLUMN, so we probe the column list first. The PRAGMA call is
+  // fast (one row per column) and avoids the try/catch-on-error pattern
+  // which would mask other migration failures.
+  const executionCols = raw
+    .prepare(`PRAGMA table_info(executions)`)
+    .all() as Array<{ name: string }>;
+  if (!executionCols.some((c) => c.name === "anomalies_json")) {
+    raw.exec(
+      `ALTER TABLE executions ADD COLUMN anomalies_json TEXT NOT NULL DEFAULT '[]'`,
+    );
+  }
 }
 
 // ============================================================================
@@ -361,11 +376,12 @@ export function updatePredictionNote(
 export function upsertExecution(db: DBHandle, e: Execution): void {
   db.raw
     .prepare(
-      `INSERT INTO executions (permutation_id, verdict, step_log_json, observed_post_state, started_at, finished_at, error_class)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO executions (permutation_id, verdict, step_log_json, anomalies_json, observed_post_state, started_at, finished_at, error_class)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(permutation_id) DO UPDATE SET
          verdict             = excluded.verdict,
          step_log_json       = excluded.step_log_json,
+         anomalies_json      = excluded.anomalies_json,
          observed_post_state = excluded.observed_post_state,
          started_at          = excluded.started_at,
          finished_at         = excluded.finished_at,
@@ -375,6 +391,7 @@ export function upsertExecution(db: DBHandle, e: Execution): void {
       e.permutation_id,
       e.verdict,
       JSON.stringify(e.step_log),
+      JSON.stringify(e.anomalies),
       e.observed_post_state,
       e.started_at,
       e.finished_at,
@@ -544,5 +561,6 @@ export function getExecution(db: DBHandle, permutationId: string): Execution | n
   return ExecutionSchema.parse({
     ...row,
     step_log: JSON.parse(String(row.step_log_json ?? "[]")),
+    anomalies: JSON.parse(String(row.anomalies_json ?? "[]")),
   });
 }

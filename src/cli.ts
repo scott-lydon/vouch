@@ -47,6 +47,7 @@ import {
   fetchHappyPathManifest,
   lowerHappyPathToRows,
 } from "./core/happy_paths.js";
+import { INPUTS_TEMPLATE, loadCatalog } from "./core/inputs.js";
 import { mapSurface } from "./core/surface.js";
 import {
   finalizeRun,
@@ -182,6 +183,17 @@ program
     };
     insertProject(db, project);
     process.stdout.write(`registered project id=${project.id} name=${project.name}\n`);
+
+    // Scaffold a vouch.inputs.yaml template next to the spec, but only if
+    // the operator doesn't already have one. The template ships with every
+    // section empty (`text: []`, `files: []`, `wallets: []`) and a fully
+    // commented example block above each. The file is INERT until the
+    // operator un-comments — no behavior change to runs unless they edit.
+    const inputsPath = resolve(process.cwd(), "vouch.inputs.yaml");
+    if (!existsSync(inputsPath)) {
+      writeFileSync(inputsPath, INPUTS_TEMPLATE, "utf8");
+      process.stdout.write(`scaffolded ${inputsPath}\n`);
+    }
   });
 
 interface RunOneDepthInputs {
@@ -262,8 +274,20 @@ async function runOneDepth(input: RunOneDepthInputs): Promise<string> {
     prediction_source: oracleSource,
   });
 
+  // Load the operator's input catalog from <cwd>/vouch.inputs.yaml. Throws
+  // early (with file path + remediation) on any malformed entry, missing
+  // env var, or missing referenced file — we'd rather fail before we spin
+  // up the browser than discover the typo on permutation 47.
+  const catalog = loadCatalog(process.cwd());
+  if (!catalog.isEmpty) {
+    process.stdout.write(
+      `[depth ${depth}] using input catalog from ${catalog.path} ` +
+        `(text=${catalog.text.length}, files=${catalog.files.length}, wallets=${catalog.wallets.length})\n`,
+    );
+  }
+
   process.stdout.write(`[depth ${depth}] mapping ${targetUrl}...\n`);
-  const surfaceActions = await mapSurface(targetUrl);
+  const surfaceActions = await mapSurface(targetUrl, {}, catalog);
 
   // ---- Happy-path manifest (optional, SUT-published) ----
   // Fetch BEFORE inserting actions so the synthesized happy-path action
@@ -1309,7 +1333,10 @@ program
   .description("Run the Surface Mapper standalone and print the action list as JSON.")
   .requiredOption("--target <url>", "URL of the system under test")
   .action(async (opts: { target: string }) => {
-    const actions = await mapSurface(opts.target);
+    // Standalone `vouch map` also honors the input catalog so the action
+    // list it prints matches what a real `vouch run` would execute.
+    const catalog = loadCatalog(process.cwd());
+    const actions = await mapSurface(opts.target, {}, catalog);
     process.stdout.write(JSON.stringify(actions, null, 2) + "\n");
   });
 

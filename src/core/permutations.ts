@@ -29,6 +29,19 @@ export interface PlanOptions {
    * depth N+1.
    */
   blockedPrefixes?: string[][];
+  /**
+   * When true, ALSO emit the zero-action permutation (`action_ids: []`) at
+   * index 0, in addition to the regular depth-N sequences. The zero-action
+   * permutation captures the landing-page state with no interaction —
+   * lets the Sketchy Checker analyze the LANDING page (low-contrast hero
+   * copy, broken images, leftover engineering jargon, etc.) which would
+   * otherwise never be screenshotted (every other permutation starts with
+   * at least one click, so the post-state is post-click).
+   *
+   * Default false because `vouch run --depth 2` shouldn't pay for an extra
+   * Playwright open it didn't ask for. The campaign command sets it true.
+   */
+  includeEmptyBaseline?: boolean;
 }
 
 export interface PlanResult {
@@ -80,6 +93,21 @@ export function generatePermutationsWithStats(
   const out: Permutation[] = [];
   const sequence: string[] = [];
   let blockedSkipCount = 0;
+
+  // Empty-baseline permutation. Emitted at index 0 when requested, so the
+  // dashboard and the sketchy phase see the landing-page screenshot before
+  // any of the depth-N sequences. We do NOT apply the blocked-prefix filter
+  // to it: an empty sequence cannot share a prefix with any non-empty
+  // blocked prefix, and the baseline is exactly what we want even when
+  // every action sequence is blocked.
+  if (opts.includeEmptyBaseline === true) {
+    out.push({
+      id: `${runId}__perm_baseline`,
+      run_id: runId,
+      action_ids: [],
+      index: 0,
+    });
+  }
 
   /**
    * Returns true if `sequence` (the full sequence at terminal depth) starts

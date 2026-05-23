@@ -398,6 +398,33 @@ async function executeOneInContext(
   // long to render) and are the correct thing for Vouch to report.
   await waitForInteractableContent(page, { timeoutMs: 3_000 });
 
+  // Initial baseline screenshot: capture the post-navigation page before any
+  // action runs. Two reasons:
+  //   1. The empty-baseline permutation (action_ids: []) has zero steps, so
+  //      without this it would produce no screenshot at all and the Sketchy
+  //      Checker would have nothing to analyze.
+  //   2. Even for non-empty perms, having the pre-action screenshot is the
+  //      only way the dashboard can show "before vs after" for the SUT,
+  //      which is the most useful regression-diff a human can eyeball.
+  //
+  // We write it as `step-init.png` (sortable before any `step-00.png`) and
+  // record it in the step_log with action_id="__init__" and ok=true so the
+  // findings analyzer + sketchy phase can locate it via the same lookup
+  // path it uses for ordinary steps. ok=true keeps the verdict pass-able;
+  // a non-pass would lie about whether the SUT crashed.
+  const initShotPath = await maybeScreenshot(page, screenshotsDir, perm.id, "init");
+  if (initShotPath !== null) {
+    stepLog.push({
+      action_id: "__init__",
+      kind: "click",
+      started_at: new Date().toISOString(),
+      finished_at: new Date().toISOString(),
+      ok: true,
+      error_message: null,
+      screenshot_path: initShotPath,
+    });
+  }
+
   let activeFocus: ActiveFocus | null = null;
   let stepIdx = 0;
   for (const actionId of perm.action_ids) {
@@ -656,13 +683,21 @@ async function maybeScreenshot(
   page: import("playwright").Page,
   screenshotsDir: string | null,
   permId: string,
-  stepIdx: number,
+  /**
+   * Numeric step index (0,1,2,...) for post-step captures, or the literal
+   * string "init" for the post-navigation baseline. Distinct filenames so
+   * sortable listings put init first (`step-init.png` < `step-00.png` by
+   * lexicographic ordering when "init" is treated as a label, which is why
+   * we DO NOT pad it to two digits).
+   */
+  stepIdx: number | "init",
 ): Promise<string | null> {
   if (!screenshotsDir) return null;
   const dir = resolve(screenshotsDir, permId);
   try {
     mkdirSync(dir, { recursive: true });
-    const path = resolve(dir, `step-${String(stepIdx).padStart(2, "0")}.png`);
+    const label = stepIdx === "init" ? "init" : String(stepIdx).padStart(2, "0");
+    const path = resolve(dir, `step-${label}.png`);
     await page.screenshot({ path, fullPage: false, timeout: 5_000 });
     return path;
   } catch {

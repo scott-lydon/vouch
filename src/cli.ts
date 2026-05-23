@@ -39,6 +39,10 @@ import {
 import { analyzeRun, cleanCleanRunScreenshots, renderFindingsMarkdown } from "./core/findings.js";
 import { generatePermutationsWithStats } from "./core/permutations.js";
 import { partitionPermsForRetest, sequenceKey } from "./core/sequences.js";
+import {
+  checkScreenshotForSketchiness,
+  detectSketchySource,
+} from "./core/sketchy.js";
 import { mapSurface } from "./core/surface.js";
 import {
   finalizeRun,
@@ -48,6 +52,7 @@ import {
   getProject,
   getProjectByName,
   getRun,
+  getSketchyVerdict,
   insertActions,
   insertBlockedPrefix,
   insertPermutations,
@@ -65,6 +70,7 @@ import {
   upsertExecution,
   upsertExpectationVerdict,
   upsertPrediction,
+  upsertSketchyVerdict,
 } from "./core/db.js";
 import { startServer } from "./dashboard/server.js";
 import { type PredictionSource } from "./core/types.js";
@@ -205,6 +211,15 @@ interface RunOneDepthInputs {
    * re-planning happens there). On for `vouch campaign`.
    */
   retestPreviouslyBroken: boolean;
+  /**
+   * When true, the planner emits one extra zero-action permutation (index
+   * 0). The executor visits the SUT, captures a baseline screenshot, and
+   * the Sketchy Checker analyzes the landing page itself. This is the only
+   * way Vouch sees the landing page for visible defects — every other
+   * perm starts with at least one click, so the post-state is post-click.
+   * Default for the campaign command, off for `vouch run`.
+   */
+  includeEmptyBaseline: boolean;
 }
 
 /**
@@ -265,6 +280,7 @@ async function runOneDepth(input: RunOneDepthInputs): Promise<string> {
     depth,
     maxSequences: maxSeq,
     blockedPrefixes: filterBlocks.map((b) => b.prefix),
+    includeEmptyBaseline: input.includeEmptyBaseline,
   });
   const perms = planResult.permutations;
   insertPermutations(db, perms);
@@ -566,6 +582,82 @@ async function runMissingPhases(input: RunMissingPhasesInputs): Promise<void> {
     process.stdout.write(`${logPrefix} executor verdicts=${JSON.stringify(counts)}\n`);
   }
 
+  // ---- Sketchy phase: vision check on each perm's last available screenshot.
+  // Skipped if no vision-capable LLM source is configured. Skipped for perms
+  // that already have a sketchy verdict (idempotent / resumable). Skipped for
+  // perms with no screenshot on disk (executor was run with --no-screenshots,
+  // or the screenshot capture itself failed best-effort).
+  //
+  // We send the LATEST screenshot per perm. For an empty-baseline perm
+  // (action_ids: []) the latest screenshot IS step-init.png, which is what
+  // we want — the landing page itself is the thing to evaluate. For a
+  // non-empty perm we send the post-last-step screenshot, which is where
+  // any visible misbehavior introduced by the action sequence shows up.
+  const sketchySource = detectSketchySource();
+  if (sketchySource === "unavailable") {
+    process.stdout.write(
+      `${logPrefix} sketchy: skipped (no vision-capable LLM configured; set ANTHROPIC_API_KEY to enable).\n`,
+    );
+  } else {
+    const sketchyPending: Array<{ perm: typeof perms[number]; shotPath: string }> = [];
+    for (const perm of perms) {
+      if (getSketchyVerdict(db, perm.id)) continue;
+      const execution = getExecution(db, perm.id);
+      if (!execution) continue; // executor failed for this perm; nothing to look at.
+      // Pick the LAST step that has a screenshot_path. Walking in reverse
+      // skips per-step screenshots from earlier steps so we evaluate the
+      // final visible state.
+      let shotPath: string | null = null;
+      for (let i = execution.step_log.length - 1; i >= 0; i--) {
+        const step = execution.step_log[i]!;
+        if (step.screenshot_path) {
+          shotPath = step.screenshot_path;
+          break;
+        }
+      }
+      if (!shotPath) continue;
+      sketchyPending.push({ perm, shotPath });
+    }
+    if (sketchyPending.length === 0) {
+      process.stdout.write(
+        `${logPrefix} sketchy: 0 perms to evaluate (already done or no screenshots on disk).\n`,
+      );
+    } else {
+      process.stdout.write(
+        `${logPrefix} sketchy: running vision check on ${sketchyPending.length} of ${perms.length} perms (source=${sketchySource}).\n`,
+      );
+      let sketchyCost = 0;
+      let cleanCount = 0;
+      let sketchyCount = 0;
+      // Sequential, not batched: each call sends a full PNG which is
+      // already a large upload. Batching would either send multiple images
+      // per call (token budget blows up fast) or interleave HTTP requests
+      // for no real win against Anthropic's per-call latency.
+      for (const job of sketchyPending) {
+        try {
+          const verdict = await checkScreenshotForSketchiness({
+            permutationId: job.perm.id,
+            screenshotPath: job.shotPath,
+            specText: project.spec_text,
+            projectName: project.name,
+            targetUrl,
+          });
+          upsertSketchyVerdict(db, verdict);
+          sketchyCost += verdict.cost_usd;
+          if (verdict.verdict === "sketchy") sketchyCount++;
+          else if (verdict.verdict === "clean") cleanCount++;
+        } catch (err) {
+          process.stderr.write(
+            `${logPrefix} sketchy: error on ${job.perm.id}: ${(err as Error).message}. Continuing.\n`,
+          );
+        }
+      }
+      process.stdout.write(
+        `${logPrefix} sketchy done (clean=${cleanCount} sketchy=${sketchyCount} cost ~$${sketchyCost.toFixed(4)})\n`,
+      );
+    }
+  }
+
   if (verify) {
     process.stdout.write(`${logPrefix} verifying expectations (source=${verifySource})...\n`);
     let verifyCost = 0;
@@ -714,6 +806,9 @@ program
         // run only the remainder. `vouch campaign` is the place that wants
         // the retest dance.
         retestPreviouslyBroken: false,
+        // Likewise, don't pay for the empty-baseline screenshot here.
+        // Campaign opts in; single-run keeps the depth-N-only contract.
+        includeEmptyBaseline: false,
       });
       process.stdout.write(
         `[vouch/run ${runId}] view at:  vouch serve  → http://localhost:7321/#/run/${runId}\n`,
@@ -845,6 +940,12 @@ program
               // Gates the remainder on those going green, auto-unblocks them
               // when they do.
               retestPreviouslyBroken: true,
+              // Capture the landing page itself as perm 0 so the Sketchy
+              // Checker sees it. Most visible-defect bugs (low contrast,
+              // misaligned form fields, leftover dev jargon, broken hero
+              // copy) live on the landing page and are otherwise invisible
+              // to every other phase.
+              includeEmptyBaseline: true,
             });
 
             const report = analyzeRun(db, runId);

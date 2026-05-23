@@ -144,6 +144,23 @@ function applyMigrations(raw: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_blocked_project_active
       ON blocked_prefixes(project_id, unblocked_at);
+
+    -- Visual-sketchy verdicts. One row per permutation that the Sketchy
+    -- Checker has examined. Written by the sketchy phase in cli.ts after
+    -- the executor finishes a permutation. Skipped when ANTHROPIC_API_KEY
+    -- is not set (no vision-capable LLM available); see detectSketchySource.
+    --
+    -- Stored separately from the executions table so the executor does not
+    -- need to know about vision-model concerns, and so a re-run of the
+    -- sketchy phase alone can be cached and resumed cleanly.
+    CREATE TABLE IF NOT EXISTS sketchy_verdicts (
+      permutation_id  TEXT PRIMARY KEY REFERENCES permutations(id) ON DELETE CASCADE,
+      verdict         TEXT NOT NULL,  -- 'clean' | 'sketchy' | 'unsupported'
+      issues_json     TEXT NOT NULL DEFAULT '[]',
+      source          TEXT NOT NULL,  -- 'anthropic-haiku-vision' | 'unavailable'
+      cost_usd        REAL NOT NULL DEFAULT 0,
+      generated_at    TEXT NOT NULL
+    );
   `);
 
   // Additive migration: add `anomalies_json` to executions on databases
@@ -571,6 +588,49 @@ function rowToBlockedPrefix(row: Record<string, unknown>): BlockedPrefix {
       ? String(row.blocked_by_permutation_id)
       : null,
     unblocked_at: row.unblocked_at ? String(row.unblocked_at) : null,
+  };
+}
+
+// ============================================================================
+// Sketchy verdicts (vision-based UI quality check)
+// ============================================================================
+
+import { type SketchyVerdict, type SketchyVerdictValue, type SketchySource } from "./sketchy.js";
+
+export function upsertSketchyVerdict(db: DBHandle, v: SketchyVerdict): void {
+  db.raw
+    .prepare(
+      `INSERT INTO sketchy_verdicts (permutation_id, verdict, issues_json, source, cost_usd, generated_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(permutation_id) DO UPDATE SET
+         verdict      = excluded.verdict,
+         issues_json  = excluded.issues_json,
+         source       = excluded.source,
+         cost_usd     = excluded.cost_usd,
+         generated_at = excluded.generated_at`,
+    )
+    .run(
+      v.permutation_id,
+      v.verdict,
+      JSON.stringify(v.issues),
+      v.source,
+      v.cost_usd,
+      v.generated_at,
+    );
+}
+
+export function getSketchyVerdict(db: DBHandle, permutationId: string): SketchyVerdict | null {
+  const row = db.raw
+    .prepare(`SELECT * FROM sketchy_verdicts WHERE permutation_id = ?`)
+    .get(permutationId) as Record<string, unknown> | undefined;
+  if (!row) return null;
+  return {
+    permutation_id: String(row.permutation_id),
+    verdict: String(row.verdict) as SketchyVerdictValue,
+    issues: JSON.parse(String(row.issues_json ?? "[]")) as string[],
+    source: String(row.source) as SketchySource,
+    cost_usd: Number(row.cost_usd),
+    generated_at: String(row.generated_at),
   };
 }
 

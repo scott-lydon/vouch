@@ -20,18 +20,24 @@ import {
   getPrediction,
   getProject,
   getRun,
+  getSketchyVerdict,
   listActionsForRun,
   listPermutationsForRun,
   type DBHandle,
 } from "./db.js";
 import { type Action, type Execution, type Permutation, type Prediction } from "./types.js";
 import { type ExpectationVerdict } from "./expectation.js";
+import { type SketchyVerdict } from "./sketchy.js";
 
 export interface Finding {
   permutation_id: string;
   /** Display id (the suffix after `__` in the globally-unique permutation_id). */
   short_id: string;
-  category: "playwright_failure" | "expectation_mismatch" | "missing_verdict";
+  category:
+    | "playwright_failure"
+    | "expectation_mismatch"
+    | "missing_verdict"
+    | "visual_sketchy";
   severity: "blocking" | "warning" | "info";
   summary: string;
   action_sequence: Array<{ id: string; kind: string; description: string; type_value: string | null }>;
@@ -66,7 +72,8 @@ export function analyzeRun(db: DBHandle, runId: string): FindingsReport {
     const prediction = getPrediction(db, perm.id);
     const execution = getExecution(db, perm.id);
     const verdict = getExpectationVerdict(db, perm.id);
-    const fs = findingsForPermutation(perm, actionsById, prediction, execution, verdict);
+    const sketchy = getSketchyVerdict(db, perm.id);
+    const fs = findingsForPermutation(perm, actionsById, prediction, execution, verdict, sketchy);
     findings.push(...fs);
   }
 
@@ -88,6 +95,7 @@ function findingsForPermutation(
   prediction: Prediction | null,
   execution: Execution | null,
   verdict: ExpectationVerdict | null,
+  sketchy: SketchyVerdict | null,
 ): Finding[] {
   const sequence = perm.action_ids.map((id) => {
     const a = actionsById.get(id);
@@ -154,6 +162,36 @@ function findingsForPermutation(
       diagnostic: "Run 'vouch campaign' or pass --verify to run-expectations to populate verdicts.",
     });
   }
+
+  // 4. Visual sketchy. ADDITIVE to the categories above — a perm can be
+  //    Playwright-pass + expectation-match + visually-sketchy (the click
+  //    worked but the resulting page has a low-contrast hero, a stuck
+  //    spinner, or leftover engineering jargon). Severity is "warning" by
+  //    default: the vision model's "this looks broken" judgment is
+  //    informed but not as load-bearing as a Playwright crash, and we want
+  //    visual findings to surface in the dashboard without auto-blocking
+  //    the entire campaign at this depth. The campaign loop in cli.ts
+  //    deliberately does NOT promote warnings to blocked_prefixes for the
+  //    same reason.
+  if (sketchy && sketchy.verdict === "sketchy" && sketchy.issues.length > 0) {
+    const headline = sketchy.issues.slice(0, 2).join("; ");
+    out.push({
+      permutation_id: perm.id,
+      short_id: short,
+      category: "visual_sketchy",
+      severity: "warning",
+      summary: `Visual issues on ${short}: ${headline.slice(0, 160)}`,
+      action_sequence: sequence,
+      expected_post_state: prediction?.expected_post_state ?? "(no prediction)",
+      observed_post_state: execution?.observed_post_state ?? "(no execution)",
+      diagnostic:
+        `Source: ${sketchy.source} ($${sketchy.cost_usd.toFixed(4)}).\n` +
+        `Issues (${sketchy.issues.length}):\n` +
+        sketchy.issues.map((s, i) => `${i + 1}. ${s}`).join("\n") +
+        `\n\nThese are visual / UX issues observed in the post-action screenshot. ` +
+        `If a flagged issue is intentional, add a note in spec.md so future sketchy passes treat it as expected.`,
+    });
+  }
   return out;
 }
 
@@ -197,11 +235,17 @@ export function renderFindingsMarkdown(report: FindingsReport): string {
   const groups: Record<Finding["category"], Finding[]> = {
     playwright_failure: [],
     expectation_mismatch: [],
+    visual_sketchy: [],
     missing_verdict: [],
   };
   for (const f of report.findings) groups[f.category].push(f);
 
-  for (const cat of ["playwright_failure", "expectation_mismatch", "missing_verdict"] as const) {
+  for (const cat of [
+    "playwright_failure",
+    "expectation_mismatch",
+    "visual_sketchy",
+    "missing_verdict",
+  ] as const) {
     if (groups[cat].length === 0) continue;
     lines.push(`## ${categoryHeading(cat)} (${groups[cat].length})`);
     lines.push("");
@@ -258,6 +302,8 @@ function categoryHeading(c: Finding["category"]): string {
       return "Playwright failures (BLOCKING)";
     case "expectation_mismatch":
       return "Expectation mismatches (BLOCKING — these are candidate SUT bugs)";
+    case "visual_sketchy":
+      return "Visual / UX issues (warning — vision-model judgment on screenshots)";
     case "missing_verdict":
       return "Permutations with no expectation verdict (informational)";
   }

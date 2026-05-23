@@ -163,7 +163,41 @@ function findingsForPermutation(
     });
   }
 
-  // 4. Visual sketchy. ADDITIVE to the categories above — a perm can be
+  // 4. Missing animation during async wait. Surfaced under the same
+  //    visual_sketchy category as the vision-model findings so the
+  //    dashboard's brown badge represents one consistent "UX is broken
+  //    here" concept across both kinds of evidence. ADDITIVE to the
+  //    categories above (a Playwright-pass click that triggered a hung-
+  //    feeling wait is still a UX bug). The anomalies live on the
+  //    Execution row, so we read them from there. We emit ONE finding per
+  //    perm even if multiple clicks each triggered a missing_animation —
+  //    the dashboard rolls the messages into one card.
+  if (execution) {
+    const animMisses = execution.anomalies.filter((a) => a.kind === "missing_animation");
+    if (animMisses.length > 0) {
+      const head = animMisses[0]!.message.split(". ")[0]!;
+      out.push({
+        permutation_id: perm.id,
+        short_id: short,
+        category: "visual_sketchy",
+        severity: "warning",
+        summary: `Missing-animation: ${head.slice(0, 160)}`,
+        action_sequence: sequence,
+        expected_post_state: prediction?.expected_post_state ?? "(no prediction)",
+        observed_post_state: execution.observed_post_state,
+        diagnostic:
+          `Source: executor animation-presence watcher.\n` +
+          `Occurrences (${animMisses.length}):\n` +
+          animMisses.map((a, i) => `${i + 1}. ${a.message}`).join("\n") +
+          `\n\nFix one of:\n` +
+          `  (a) Add an animated loading indicator (CSS animation, transition, [role=progressbar], or [aria-busy=true]).\n` +
+          `  (b) Make the async work faster than the flag threshold (default 500ms).\n` +
+          `  (c) If the wait is intentionally silent and the SUT design demands it, document the choice in spec.md so the sketchy phase treats this as expected.`,
+      });
+    }
+  }
+
+  // 5. Visual sketchy. ADDITIVE to the categories above — a perm can be
   //    Playwright-pass + expectation-match + visually-sketchy (the click
   //    worked but the resulting page has a low-contrast hero, a stuck
   //    spinner, or leftover engineering jargon). Severity is "warning" by

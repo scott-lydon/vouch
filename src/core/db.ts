@@ -514,6 +514,27 @@ export function listActiveBlockedPrefixes(db: DBHandle, projectId: string): Bloc
   return rows.map(rowToBlockedPrefix);
 }
 
+/**
+ * Active blocked prefixes whose length exactly equals `depth`. These are the
+ * sequences that crashed or mismatched AT this depth and got recorded for the
+ * project. The campaign loop's "retest the previously broken sequences first"
+ * pass uses this to find which exact click-sequences to re-execute before
+ * running the rest of the depth's plan.
+ *
+ * Why length === depth: a length-K block at depth N (N > K) means "everything
+ * that starts with this K-length crash is filtered out of the N-length plan."
+ * That's the correct filter for deeper depths. The retest pass deliberately
+ * targets only the blocks discovered AT this exact depth, so retesting
+ * [A,B] happens at depth 2, not at depth 3 (where it would be a fragment).
+ */
+export function listActiveBlockedPrefixesAtDepth(
+  db: DBHandle,
+  projectId: string,
+  depth: number,
+): BlockedPrefix[] {
+  return listActiveBlockedPrefixes(db, projectId).filter((b) => b.prefix.length === depth);
+}
+
 export function listAllBlockedPrefixes(db: DBHandle, projectId: string): BlockedPrefix[] {
   const rows = db.raw
     .prepare(`SELECT * FROM blocked_prefixes WHERE project_id = ? ORDER BY blocked_at DESC`)

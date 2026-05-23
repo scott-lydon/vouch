@@ -19,10 +19,24 @@
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-import { chromium, type Browser } from "playwright";
+import { chromium, type Browser, type BrowserContext } from "playwright";
 
 import { waitForInteractableContent } from "./page-utils.js";
 import { type Action, type Execution, type Permutation, type Verdict } from "./types.js";
+
+/**
+ * Thrown by the executor for failures that are not a single permutation's
+ * fault: chromium fails to launch, Playwright binary missing, host starved,
+ * etc. The message is the diagnosis. It names the failed operation, lists
+ * the most common causes, and points at the literal fix command, so the
+ * CLI can print it verbatim and the user can act without grepping source.
+ */
+export class VouchExecutorError extends Error {
+  constructor(message: string, public override readonly cause?: unknown) {
+    super(message);
+    this.name = "VouchExecutorError";
+  }
+}
 
 export interface ExecuteOptions {
   targetUrl: string;
@@ -30,6 +44,32 @@ export interface ExecuteOptions {
   stepTimeoutMs?: number;
   /** Navigation timeout for goto(). Default 15s. */
   navTimeoutMs?: number;
+  /**
+   * Hard wallclock cap on `chromium.launch()`. If exceeded, throws
+   * VouchExecutorError with diagnostic hints instead of hanging the run
+   * forever. Default 30 s.
+   *
+   * Why a cap: Playwright's launch is unbounded by default. If the Chromium
+   * binary is not installed, the host is starved, or sandbox flags block
+   * the spawn, the call sits indefinitely and the entire run becomes
+   * unrecoverable without a manual kill. 30 s is well above the 1 to 3 s a
+   * healthy launch takes and well below any reasonable patience threshold.
+   */
+  launchTimeoutMs?: number;
+  /**
+   * Hard wallclock cap on the work for a single permutation: context
+   * creation, navigation, hydration wait, every step, observePostState. If
+   * the cap fires, the permutation is force closed, an Execution row is
+   * written with verdict "timeout" and error_class "perm_wallclock_exceeded",
+   * and the run proceeds to the next permutation. Default 90 s.
+   *
+   * Why distinct from stepTimeoutMs: stepTimeoutMs bounds one interaction
+   * (click, focus, type). A depth N permutation can have N steps plus N
+   * settles plus the navigation. The step cap does not bound their sum.
+   * If an SUT path enters a fetch loop or shows a stuck modal, a single
+   * permutation can stall the whole run; this cap is the backstop.
+   */
+  permTimeoutMs?: number;
   /**
    * If set, captures a PNG screenshot after each step into
    * `<screenshotsDir>/<perm_id>/step-<n>.png`. The findings analyzer is
@@ -42,6 +82,8 @@ export interface ExecuteOptions {
 
 const DEFAULT_STEP_TIMEOUT_MS = 8_000;
 const DEFAULT_NAV_TIMEOUT_MS = 15_000;
+const DEFAULT_LAUNCH_TIMEOUT_MS = 30_000;
+const DEFAULT_PERM_TIMEOUT_MS = 90_000;
 
 interface ActiveFocus {
   selector: string;
@@ -60,15 +102,17 @@ export async function executePermutations(
 ): Promise<Execution[]> {
   const stepTimeout = opts.stepTimeoutMs ?? DEFAULT_STEP_TIMEOUT_MS;
   const navTimeout = opts.navTimeoutMs ?? DEFAULT_NAV_TIMEOUT_MS;
+  const launchTimeout = opts.launchTimeoutMs ?? DEFAULT_LAUNCH_TIMEOUT_MS;
+  const permTimeout = opts.permTimeoutMs ?? DEFAULT_PERM_TIMEOUT_MS;
   const screenshotsDir = opts.screenshotsDir ?? null;
   const out: Execution[] = [];
 
   let browser: Browser | null = null;
   try {
-    browser = await chromium.launch({ headless: true });
+    browser = await launchChromiumWithTimeout(launchTimeout);
     for (const perm of permutations) {
       out.push(
-        await executeOne(
+        await executeOneCapped(
           browser,
           perm,
           actionsById,
@@ -76,16 +120,106 @@ export async function executePermutations(
           stepTimeout,
           navTimeout,
           screenshotsDir,
+          permTimeout,
         ),
       );
     }
   } finally {
-    if (browser) await browser.close();
+    if (browser) {
+      // Best effort. The run's results are already in `out`; a close failure
+      // here would only mask them. Never swallow the launch error itself,
+      // because it surfaced before this finally ran.
+      await browser.close().catch(() => {});
+    }
   }
   return out;
 }
 
-async function executeOne(
+/**
+ * Launch Chromium with a hard wallclock cap.
+ *
+ * If the cap fires while Playwright is still spinning up, the in-flight
+ * launch is given a `then` handler that closes any Browser that arrives
+ * late, so a slow launcher does not leak a zombie chromium process per
+ * timeout. The mapped promise also re-throws so it cannot win the race
+ * after we have already given up.
+ *
+ * Failure messages are diagnostic on purpose: they name the operation, list
+ * the four common root causes, and point at the literal fix command. This
+ * is the most common "vouch hangs forever" failure mode, so the error path
+ * is worth the prose.
+ */
+async function launchChromiumWithTimeout(timeoutMs: number): Promise<Browser> {
+  let timedOut = false;
+  const launchPromise = chromium.launch({ headless: true });
+
+  const guarded: Promise<Browser> = launchPromise.then(
+    (browser) => {
+      if (timedOut) {
+        browser.close().catch(() => {});
+        throw new VouchExecutorError(
+          `internal: chromium.launch() resolved after the ${timeoutMs}ms cap had already fired. The browser was closed; nothing actionable for the user.`,
+        );
+      }
+      return browser;
+    },
+    (err) => {
+      // The real Playwright launch failure. Wrap with a fix hint so the CLI
+      // can print one actionable line instead of a stack trace.
+      throw new VouchExecutorError(
+        `chromium.launch() failed: ${(err as Error).message ?? String(err)}. ` +
+          `Most common cause: Chromium is not installed in this Playwright version's cache. ` +
+          `Run 'npx playwright install chromium' from the vouch project root, then retry. ` +
+          `Docs: https://playwright.dev/docs/intro#installing-playwright`,
+        err,
+      );
+    },
+  );
+
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<Browser>((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      timedOut = true;
+      reject(
+        new VouchExecutorError(
+          `chromium.launch() exceeded the ${timeoutMs}ms wallclock cap. ` +
+            `Common causes: ` +
+            `(1) Chromium not installed in the Playwright cache. Fix: 'npx playwright install chromium'. ` +
+            `(2) Host resource starvation (too many parallel runs, low memory). Fix: lower concurrency or run one vouch process at a time. ` +
+            `(3) Sandbox restriction in a Linux container. Fix: launch with '--no-sandbox' args or run outside the container. ` +
+            `(4) Antivirus quarantining the Chromium binary. ` +
+            `Raise the cap via ExecuteOptions.launchTimeoutMs or env VOUCH_LAUNCH_TIMEOUT_MS if your environment actually needs more than ${timeoutMs}ms. ` +
+            `Docs: https://playwright.dev/docs/intro#installing-playwright`,
+        ),
+      );
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([guarded, timeoutPromise]);
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
+}
+
+/**
+ * Wrap a single permutation in a hard wallclock cap. If the cap fires:
+ *   - timedOut is set so the in-flight work knows it's lost the race.
+ *   - The browser context is force-closed so any pending Playwright
+ *     interaction (a hung navigation, stuck modal, fetch loop) aborts.
+ *   - A synthetic Execution row is returned with verdict "timeout" and
+ *     error_class "perm_wallclock_exceeded" so the dashboard surfaces
+ *     a fix hint rather than a stack trace.
+ *
+ * If work finishes normally before the cap, the cleanup path closes the
+ * context once and clears the timer.
+ *
+ * Why ctx is created here rather than inside `executeOneInContext`: the
+ * timeout handler needs a reference to force-close it; passing it down
+ * would create a circular ownership story. Owning ctx here keeps the
+ * cleanup responsibility in one place.
+ */
+async function executeOneCapped(
   browser: Browser,
   perm: Permutation,
   actionsById: Map<string, Action>,
@@ -93,99 +227,179 @@ async function executeOne(
   stepTimeout: number,
   navTimeout: number,
   screenshotsDir: string | null,
+  permTimeoutMs: number,
 ): Promise<Execution> {
   const startedAt = new Date().toISOString();
+  let ctx: BrowserContext;
+  try {
+    ctx = await browser.newContext();
+  } catch (err) {
+    // Context creation failed before any step ran. Surface clearly so the
+    // operator can tell this from a per-step Playwright error.
+    return {
+      permutation_id: perm.id,
+      verdict: "infrastructure_error",
+      step_log: [],
+      observed_post_state:
+        `browser.newContext() failed before any step ran: ${(err as Error).message ?? String(err)}. ` +
+        `If this recurs across many perms, the chromium process likely crashed mid-run; abort and rerun vouch.`,
+      started_at: startedAt,
+      finished_at: new Date().toISOString(),
+      error_class: "context_create_failed",
+    };
+  }
+
+  let timedOut = false;
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+
+  const work = executeOneInContext(
+    ctx,
+    perm,
+    actionsById,
+    targetUrl,
+    stepTimeout,
+    navTimeout,
+    screenshotsDir,
+    startedAt,
+  );
+  // Suppress an unhandled-rejection log if work loses the race to the cap.
+  // The timeout path resolves with a synthetic Execution; the work promise
+  // that races against it may still reject later from a force-closed page.
+  work.catch(() => {});
+
+  const cap = new Promise<Execution>((resolve) => {
+    timeoutHandle = setTimeout(() => {
+      timedOut = true;
+      // Best-effort force-close. If close itself stalls, that's a Playwright
+      // bug we can't paper over here, but we already have a verdict.
+      ctx.close().catch(() => {});
+      resolve({
+        permutation_id: perm.id,
+        verdict: "timeout",
+        step_log: [],
+        observed_post_state:
+          `Permutation exceeded the per-permutation wallclock cap of ${permTimeoutMs}ms. ` +
+          `The browser context was force-closed and the run continued. ` +
+          `If this recurs: ` +
+          `(1) Raise opts.permTimeoutMs or env VOUCH_PERM_TIMEOUT_MS. ` +
+          `(2) Lower --depth so each permutation has fewer steps. ` +
+          `(3) Investigate the SUT path this sequence exercises (likely a fetch loop or stuck modal).`,
+        started_at: startedAt,
+        finished_at: new Date().toISOString(),
+        error_class: "perm_wallclock_exceeded",
+      });
+    }, permTimeoutMs);
+  });
+
+  try {
+    return await Promise.race([work, cap]);
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    if (!timedOut) {
+      // Normal-completion close. The timeout path already closed ctx itself.
+      await ctx.close().catch(() => {});
+    }
+  }
+}
+
+async function executeOneInContext(
+  ctx: BrowserContext,
+  perm: Permutation,
+  actionsById: Map<string, Action>,
+  targetUrl: string,
+  stepTimeout: number,
+  navTimeout: number,
+  screenshotsDir: string | null,
+  startedAt: string,
+): Promise<Execution> {
   const stepLog: Execution["step_log"] = [];
   let verdict: Verdict = "pass";
   let errorClass: string | null = null;
   let observedPostState = "";
 
-  const ctx = await browser.newContext();
+  // ctx is owned by executeOneCapped (the wrapper) so this function does NOT
+  // close it. The wrapper closes it on both the normal and timeout paths.
   const page = await ctx.newPage();
   try {
-    try {
-      await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: navTimeout });
-    } catch (err) {
-      verdict = "infrastructure_error";
-      errorClass = "navigation_failed";
-      observedPostState = `Navigation to ${targetUrl} failed: ${(err as Error).message}`;
-      const finishedAt = new Date().toISOString();
-      return {
-        permutation_id: perm.id,
-        verdict,
-        step_log: stepLog,
-        observed_post_state: observedPostState,
-        started_at: startedAt,
-        finished_at: finishedAt,
-        error_class: errorClass,
-      };
-    }
-    // Settle: same hydration-wait the Surface Mapper does after goto. Without
-    // it, the executor would try to interact with selectors that exist in the
-    // discovered-actions table (mapped after settle) but don't yet exist in
-    // the page at the moment we navigate fresh for this permutation. The cap
-    // is short (3s) because per-permutation freshness is amortized differently
-    // than per-run mapping — we're paying the cap on every permutation, so
-    // overpaying compounds. 3s is enough for typical SPA hydration on a warm
-    // browser; pages slower than that hit the cap and proceed with whatever
-    // exists, which surfaces as Playwright errors on the first step that
-    // references an unrendered element. Those errors are real bugs (the SUT
-    // takes too long to render) and are the correct thing for Vouch to report.
-    await waitForInteractableContent(page, { timeoutMs: 3_000 });
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: navTimeout });
+  } catch (err) {
+    verdict = "infrastructure_error";
+    errorClass = "navigation_failed";
+    observedPostState = `Navigation to ${targetUrl} failed: ${(err as Error).message}`;
+    const finishedAt = new Date().toISOString();
+    return {
+      permutation_id: perm.id,
+      verdict,
+      step_log: stepLog,
+      observed_post_state: observedPostState,
+      started_at: startedAt,
+      finished_at: finishedAt,
+      error_class: errorClass,
+    };
+  }
+  // Settle: same hydration wait the Surface Mapper does after goto. Without
+  // it, the executor would try to interact with selectors that exist in the
+  // discovered-actions table (mapped after settle) but don't yet exist in
+  // the page at the moment we navigate fresh for this permutation. The cap
+  // is short (3s) because per-permutation freshness is amortized differently
+  // than per-run mapping; we pay the cap on every permutation, so overpaying
+  // compounds. 3s is enough for typical SPA hydration on a warm browser;
+  // pages slower than that hit the cap and proceed with whatever exists,
+  // which surfaces as Playwright errors on the first step that references
+  // an unrendered element. Those errors are real bugs (the SUT takes too
+  // long to render) and are the correct thing for Vouch to report.
+  await waitForInteractableContent(page, { timeoutMs: 3_000 });
 
-    let activeFocus: ActiveFocus | null = null;
-    let stepIdx = 0;
-    for (const actionId of perm.action_ids) {
-      const action = actionsById.get(actionId);
-      const stepStart = new Date().toISOString();
-      if (!action) {
-        stepLog.push({
-          action_id: actionId,
-          kind: "click",
-          started_at: stepStart,
-          finished_at: new Date().toISOString(),
-          ok: false,
-          error_message: `Unknown action id '${actionId}' (not present in this run's actions table).`,
-          screenshot_path: null,
-        });
-        verdict = "infrastructure_error";
-        errorClass = "unknown_action_id";
-        break;
-      }
-      let stepOk = true;
-      let stepErr: string | null = null;
-      try {
-        await playStep(page, action, activeFocus, stepTimeout);
-        if (action.kind === "focus_input") {
-          activeFocus = { selector: action.selector ?? "" };
-        } else {
-          activeFocus = null;
-        }
-      } catch (err) {
-        stepOk = false;
-        stepErr = (err as Error).message;
-        const isTimeout = /Timeout|timeout/i.test(stepErr);
-        verdict = isTimeout ? "timeout" : "fail";
-        errorClass = isTimeout ? "playwright_timeout" : "playwright_action_error";
-      }
-      const shotPath = await maybeScreenshot(page, screenshotsDir, perm.id, stepIdx);
+  let activeFocus: ActiveFocus | null = null;
+  let stepIdx = 0;
+  for (const actionId of perm.action_ids) {
+    const action = actionsById.get(actionId);
+    const stepStart = new Date().toISOString();
+    if (!action) {
       stepLog.push({
         action_id: actionId,
-        kind: action.kind,
+        kind: "click",
         started_at: stepStart,
         finished_at: new Date().toISOString(),
-        ok: stepOk,
-        error_message: stepErr,
-        screenshot_path: shotPath,
+        ok: false,
+        error_message: `Unknown action id '${actionId}' (not present in this run's actions table).`,
+        screenshot_path: null,
       });
-      stepIdx++;
-      if (!stepOk) break;
+      verdict = "infrastructure_error";
+      errorClass = "unknown_action_id";
+      break;
     }
-
-    observedPostState = await observePostState(page);
-  } finally {
-    await ctx.close();
+    let stepOk = true;
+    let stepErr: string | null = null;
+    try {
+      await playStep(page, action, activeFocus, stepTimeout);
+      if (action.kind === "focus_input") {
+        activeFocus = { selector: action.selector ?? "" };
+      } else {
+        activeFocus = null;
+      }
+    } catch (err) {
+      stepOk = false;
+      stepErr = (err as Error).message;
+      const isTimeout = /Timeout|timeout/i.test(stepErr);
+      verdict = isTimeout ? "timeout" : "fail";
+      errorClass = isTimeout ? "playwright_timeout" : "playwright_action_error";
+    }
+    const shotPath = await maybeScreenshot(page, screenshotsDir, perm.id, stepIdx);
+    stepLog.push({
+      action_id: actionId,
+      kind: action.kind,
+      started_at: stepStart,
+      finished_at: new Date().toISOString(),
+      ok: stepOk,
+      error_message: stepErr,
+      screenshot_path: shotPath,
+    });
+    stepIdx++;
+    if (!stepOk) break;
   }
+
+  observedPostState = await observePostState(page);
   const finishedAt = new Date().toISOString();
   return {
     permutation_id: perm.id,

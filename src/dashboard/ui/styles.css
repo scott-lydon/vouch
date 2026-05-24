@@ -126,3 +126,24 @@ tr:nth-child(even) td { background: rgba(35, 45, 68, 0.4); }
 .step-detail-row code { word-break: break-all; }
 details.step-row > summary > span.text-xs { transition: opacity 0.12s ease; }
 details.step-row[open] > summary > span.text-xs { opacity: 0 !important; }
+
+/* Per-step screenshot thumbnail + final-state thumbnail. The .thumb wrapper
+   gives us a place to hang the HD badge in a corner without offsetting the
+   image itself. Click-target is the whole wrapper so the badge does not
+   create a dead zone the cursor falls into. */
+.shot-thumb { position: relative; display: inline-block; cursor: zoom-in; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: var(--panel2); }
+.shot-thumb:hover { border-color: var(--accent2); }
+.shot-thumb img { display: block; max-height: 120px; max-width: 100%; }
+.shot-thumb .shot-badge { position: absolute; top: 4px; right: 4px; background: rgba(99, 102, 241, 0.85); color: #fff; font-size: 0.65rem; font-weight: 700; padding: 1px 6px; border-radius: 4px; letter-spacing: 0.04em; }
+.shot-thumb .shot-caption { position: absolute; bottom: 0; left: 0; right: 0; background: rgba(10, 14, 26, 0.7); color: var(--muted); font-size: 0.65rem; padding: 2px 6px; }
+.shot-final { display: block; margin-top: 12px; }
+.shot-final .shot-thumb img { max-height: 180px; }
+
+/* Lightbox overlay used when a thumbnail is clicked. Singleton appended to
+   body on first open. Backdrop or Esc closes it. Image is bounded to the
+   viewport so very tall screenshots stay readable without horizontal scroll. */
+.lightbox-backdrop { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.85); z-index: 9999; display: flex; align-items: center; justify-content: center; padding: 32px; cursor: zoom-out; }
+.lightbox-backdrop img { max-width: 100%; max-height: 100%; border-radius: 8px; box-shadow: 0 12px 48px rgba(0, 0, 0, 0.6); }
+.lightbox-backdrop .lightbox-caption { position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--panel); border: 1px solid var(--border); color: var(--text); font-size: 0.8rem; padding: 6px 12px; border-radius: 999px; }
+.lightbox-backdrop .lightbox-close { position: absolute; top: 16px; right: 16px; background: var(--panel); border: 1px solid var(--border); color: var(--text); font-size: 1rem; width: 36px; height: 36px; border-radius: 999px; cursor: pointer; }
+.lightbox-backdrop .lightbox-close:hover { border-color: var(--accent2); color: var(--accent2); }

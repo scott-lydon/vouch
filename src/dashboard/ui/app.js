@@ -479,6 +479,103 @@ function sourceLabel(src) {
 }
 
 /**
+ * Singleton image lightbox controller. The first call wires DOM and key/click
+ * handlers; subsequent calls reuse them. Backdrop click or Escape key closes.
+ *
+ * Why a singleton: keeping ONE backdrop element keeps the DOM clean across
+ * many open/close cycles, and the Escape handler binds once instead of
+ * per-thumbnail. We DO rebuild the inner <img> on every open so the browser
+ * starts a fresh load instead of flashing the previous image.
+ */
+const lightbox = (() => {
+  let backdrop = null;
+  let img = null;
+  let caption = null;
+
+  function ensureBuilt() {
+    if (backdrop) return;
+    backdrop = el('div', {
+      class: 'lightbox-backdrop',
+      style: 'display:none;',
+      onClick: (e) => {
+        // Only close on backdrop click — clicks on the image itself bubble
+        // up but should NOT close (gives the user a fixed target to keep
+        // pointer-down without dismissing the view).
+        if (e.target === backdrop) close();
+      },
+    });
+    const closeBtn = el('button', {
+      class: 'lightbox-close',
+      type: 'button',
+      'aria-label': 'Close screenshot view',
+      onClick: close,
+    }, '×');
+    img = el('img', { alt: '' });
+    caption = el('div', { class: 'lightbox-caption' });
+    backdrop.appendChild(closeBtn);
+    backdrop.appendChild(img);
+    backdrop.appendChild(caption);
+    document.body.appendChild(backdrop);
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && backdrop.style.display !== 'none') close();
+    });
+  }
+
+  function open(url, captionText) {
+    ensureBuilt();
+    img.src = url;
+    img.alt = captionText || 'Screenshot';
+    caption.textContent = captionText || '';
+    backdrop.style.display = 'flex';
+  }
+
+  function close() {
+    if (!backdrop) return;
+    backdrop.style.display = 'none';
+    // Drop the src so a fresh open does not show the previous image while
+    // the new one loads. Browsers garbage-collect the buffer once the src
+    // is cleared.
+    img.removeAttribute('src');
+  }
+
+  return { open };
+})();
+
+/**
+ * Build a clickable screenshot thumbnail. `lo` is the thumbnail image URL
+ * (typically a JPEG) and `hi` is the optional hires URL (PNG) preferred by
+ * the lightbox when set. Either may be null. Returns null when both are
+ * null so the caller can `.filter(Boolean)` cleanly without an empty box.
+ *
+ * The HD badge surfaces when a hires version exists, telling the operator
+ * the click will load the higher-fidelity capture (the failing-state PNG
+ * or the post-loop final-state PNG).
+ */
+function screenshotThumb(lo, hi, captionText) {
+  if (!lo && !hi) return null;
+  const thumbSrc = lo || hi;
+  const lightboxSrc = hi || lo;
+  const children = [
+    el('img', { src: thumbSrc, alt: captionText || 'Screenshot', loading: 'lazy' }),
+  ];
+  if (hi) children.push(el('span', { class: 'shot-badge' }, 'HD'));
+  if (captionText) children.push(el('span', { class: 'shot-caption' }, captionText));
+  return el('div', {
+    class: 'shot-thumb',
+    role: 'button',
+    tabindex: '0',
+    title: 'Click to view full-size',
+    onClick: () => lightbox.open(lightboxSrc, captionText || ''),
+    onKeydown: (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        lightbox.open(lightboxSrc, captionText || '');
+      }
+    },
+  }, children);
+}
+
+/**
  * Human label for the step-execution verdict (what Playwright did). The badge
  * still uses the same color logic, but the label is in plain terms.
  */
@@ -509,6 +606,24 @@ function renderPermutationCard(p, actions) {
   const shortId = p.permutation.id.includes('__') ? p.permutation.id.split('__').pop() : p.permutation.id;
   const oneIndexed = (p.permutation.index ?? 0) + 1;
   const permLabel = `Permutation ${oneIndexed} (${shortId})`;
+
+  // Pair action_descriptions with execution.step_log screenshots. step_log
+  // starts with a synthetic "__init__" entry that has no matching action,
+  // so action_descriptions[i] aligns with step_log[i+1] when the init shot
+  // exists. We expose two lookups:
+  //   - initShot: the post-navigation baseline screenshot (or null)
+  //   - shotFor(actionIndex): the post-step screenshots for action i, or null
+  // Map by action_id rather than positional index so an executor that
+  // skipped a step (e.g. unknown action_id break) doesn't desync the pair.
+  const stepShots = p.step_screenshots ?? [];
+  const initShot = stepShots.find((s) => s.action_id === '__init__') ?? null;
+  const shotByActionId = new Map();
+  for (const s of stepShots) {
+    if (s.action_id !== '__init__') shotByActionId.set(s.action_id, s);
+  }
+  function shotFor(actionId) {
+    return shotByActionId.get(actionId) ?? null;
+  }
 
   // Each step is a click-to-expand <details>. Summary stays clean (step N,
   // kind chip, human description); the technical detail (CSS selector, typed
@@ -543,7 +658,15 @@ function renderPermutationCard(p, actions) {
           ? el('span', { class: 'muted text-xs ml-2', style: 'opacity:0.6;' }, '› expand')
           : null,
       ];
-      if (!hasDetail) {
+      // Per-step thumbnail. Pulled BEFORE the hasDetail short-circuit so a
+      // step that has no selector/type_value detail still gets its
+      // screenshot row when a capture exists (e.g. a resize_viewport step
+      // with no selector still produces a meaningful post-state shot).
+      const stepShot = shotFor(ad.id);
+      const stepThumb = stepShot
+        ? screenshotThumb(stepShot.lo, stepShot.hi, `step ${i + 1}: post-${ad.kind}`)
+        : null;
+      if (!hasDetail && !stepThumb) {
         return el('div', { class: 'step-row text-sm' }, summaryChildren.slice(0, 3));
       }
       const detailRows = [];
@@ -569,12 +692,45 @@ function renderPermutationCard(p, actions) {
           el('code', {}, ad.id),
         ]),
       );
+      if (stepThumb) {
+        detailRows.push(
+          el('div', { class: 'step-detail-row' }, [
+            el('span', { class: 'muted text-xs', style: 'min-width: 80px; display: inline-block;' }, 'screenshot:'),
+            stepThumb,
+          ]),
+        );
+      }
       return el('details', { class: 'step-row' }, [
         el('summary', { class: 'step-summary text-sm', style: 'list-style:none; cursor:pointer;' }, summaryChildren),
         el('div', { class: 'step-detail-body' }, detailRows),
       ]);
     }),
   );
+
+  // Init / final-state thumbnails. These bookend the step list so an
+  // auditor can see "where the perm started" and "where it ended up"
+  // without expanding every individual step. The init shot is lores-only
+  // by capture policy; the final shot is hires PNG so the HD badge will
+  // surface there. Both render only when their underlying URL exists.
+  const bookendsRow = [];
+  if (initShot && (initShot.lo || initShot.hi)) {
+    const t = screenshotThumb(initShot.lo, initShot.hi, 'init (post-navigation)');
+    if (t) bookendsRow.push(el('div', { class: 'shot-final' }, [
+      el('div', { class: 'muted text-xs mb-1' }, 'Initial state'),
+      t,
+    ]));
+  }
+  if (p.final_state_screenshot) {
+    // The final-state capture is hires-only; pass it as both lo and hi so
+    // the thumbnail renders and the lightbox loads the full PNG. No HD
+    // badge appears in this case (lo === hi); the surrounding label makes
+    // the fidelity obvious without needing the badge.
+    const t = screenshotThumb(p.final_state_screenshot, p.final_state_screenshot, 'final state (post-loop)');
+    if (t) bookendsRow.push(el('div', { class: 'shot-final' }, [
+      el('div', { class: 'muted text-xs mb-1' }, 'Final state'),
+      t,
+    ]));
+  }
 
   const prediction = p.prediction;
   const predictionBlock = prediction
@@ -632,6 +788,14 @@ function renderPermutationCard(p, actions) {
       ])
     : null;
 
+  // Bookend thumbnails get their own flex container so init + final sit
+  // side-by-side on a wide screen and stack on narrow. Inserted between
+  // the step list and the prediction block — high enough in the card that
+  // an auditor sees state evidence before reading textual analysis.
+  const bookendsBlock = bookendsRow.length > 0
+    ? el('div', { class: 'flex flex-wrap gap-3 mb-3' }, bookendsRow)
+    : null;
+
   return el('div', { class: cardClass }, [
     el('div', { class: 'flex items-start justify-between gap-3 mb-3 flex-wrap' }, [
       el('div', {}, [
@@ -641,6 +805,7 @@ function renderPermutationCard(p, actions) {
       el('span', { class: 'badge ' + primary.badge, style: 'font-size: 0.85rem; padding: 6px 14px;' }, primary.label),
     ]),
     actionsList,
+    bookendsBlock,
     predictionBlock,
     note,
     execBlock,

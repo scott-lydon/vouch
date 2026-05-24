@@ -10,7 +10,8 @@
 // overwrites the model's prediction itself (those are upserted only by the
 // oracle pass).
 
-import { dirname, resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import express from "express";
@@ -33,11 +34,76 @@ import { analyzeRun, renderFindingsMarkdown } from "../core/findings.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = resolve(__dirname, "ui");
 
+/**
+ * Absolute root of the runs/ directory the executor writes screenshots into.
+ * Resolved at server start so the static handler can scope itself to this
+ * subtree only — we deliberately do NOT mount the entire runs/ root, because
+ * it also holds `*.findings.md` reports and other non-image artifacts that
+ * have no business being world-readable through the dashboard.
+ *
+ * Resolution mirrors the same `resolve(process.cwd(), "runs", runId, ...)`
+ * pattern the CLI uses for `--screenshots`, so a server started from the
+ * vouch project root finds the same paths the executor wrote to.
+ */
+const RUNS_ROOT = resolve(process.cwd(), "runs");
+
+/**
+ * Translate an executor-written absolute screenshot path into the URL the
+ * dashboard's static route exposes. Returns null when the path is missing,
+ * outside the runs root (defense against a stale row pointing somewhere
+ * unexpected), or the file no longer exists on disk (a clean-perm prune
+ * already removed it).
+ *
+ * Why the existsSync check: the findings cleanup pass deletes per-perm
+ * screenshot dirs for clean perms, but the step_log rows in vouch.db still
+ * reference the now-gone paths. Returning a non-null URL there would render
+ * a broken-image icon in the dashboard; null lets the UI skip the thumbnail
+ * cleanly.
+ */
+function screenshotUrlForAbsPath(absPath: string | null | undefined): string | null {
+  if (!absPath) return null;
+  const resolved = resolve(absPath);
+  const rel = relative(RUNS_ROOT, resolved);
+  // relative() returns a path that starts with ".." or is absolute when the
+  // target is outside the base. Reject both — that's the path-traversal
+  // defense for the static route.
+  if (rel.startsWith("..") || rel.startsWith("/")) return null;
+  if (!existsSync(resolved)) return null;
+  return `/runs/${rel.split("\\").join("/")}`;
+}
+
 export async function startServer(dbPath: string, port: number): Promise<void> {
   const db = openDB(dbPath);
   const app = express();
   app.use(express.json({ limit: "256kb" }));
   app.use(express.static(UI_DIR));
+
+  // Scoped static route for screenshots. Two layers of defense:
+  //
+  //   1. Extension allowlist middleware that runs BEFORE express.static so
+  //      requests for non-image paths under runs/ get a hard 403. Without
+  //      this a request like /runs/<id>.findings.md would slip through and
+  //      expose the markdown reports to anyone with the URL.
+  //   2. express.static itself rejects `..` traversal that would escape the
+  //      mounted root (RUNS_ROOT), so a malformed URL cannot reach vouch.db
+  //      or source files outside runs/.
+  //
+  // `fallthrough: false` on static() makes missing files 404 instead of
+  // continuing to the SPA fallback (which would serve index.html under an
+  // image content-type and quietly fail in the browser).
+  app.use("/runs", (req, res, next) => {
+    const lower = req.path.toLowerCase();
+    if (
+      lower.endsWith(".jpg") ||
+      lower.endsWith(".jpeg") ||
+      lower.endsWith(".png")
+    ) {
+      next();
+      return;
+    }
+    res.status(403).type("text/plain").send("Forbidden: only screenshot files are served from /runs.");
+  });
+  app.use("/runs", express.static(RUNS_ROOT, { fallthrough: false }));
 
   // ---- read endpoints ----
 
@@ -69,11 +135,29 @@ export async function startServer(dbPath: string, port: number): Promise<void> {
       const prediction = getPrediction(db, p.id);
       const execution = getExecution(db, p.id);
       const expectation = getExpectationVerdict(db, p.id);
+      // Pre-compute per-step screenshot URLs and the final-state URL so the
+      // dashboard UI does not have to know about the runs/ filesystem
+      // layout. This is the ONLY surface that translates absolute
+      // executor-written paths into URLs; the UI treats the URLs as opaque
+      // strings to drop into <img src>. Both lo and hi can be null
+      // independently (lo when capture was off, hi only on failing steps
+      // or post-loop). The init step in step_log gets the same treatment
+      // and the UI renders it as the first thumbnail in the strip.
+      const step_screenshots = (execution?.step_log ?? []).map((s) => ({
+        action_id: s.action_id,
+        lo: screenshotUrlForAbsPath(s.screenshot_path),
+        hi: screenshotUrlForAbsPath(s.screenshot_path_hires),
+      }));
+      const final_state_screenshot = execution
+        ? screenshotUrlForAbsPath(execution.final_state_screenshot_path)
+        : null;
       return {
         permutation: p,
         prediction,
         execution,
         expectation,
+        step_screenshots,
+        final_state_screenshot,
         action_descriptions: p.action_ids.map((id) => {
           const a = actions.find((x) => x.id === id);
           if (!a) return null;

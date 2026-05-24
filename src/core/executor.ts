@@ -919,10 +919,20 @@ function watchForAnimationDuringWait(
 
 /**
  * Step-index label used by both lores and hires capture paths. Numeric
- * indexes pad to two digits so lexicographic sort matches numeric sort
- * (step-00, step-01, ... step-99). The literal labels "init" and "final"
- * are NOT padded and they intentionally land at the boundaries of any
- * sorted listing: "init" < "00" and "99" < "final".
+ * indexes pad to 3 digits (step-000, step-001, ...) so a future deep
+ * permutation at index >= 100 still produces filenames that align under
+ * naive numeric-vs-lex assumptions a future contributor might make
+ * (the previous 2-digit pad broke at depth >= 100). The literal labels
+ * "init" and "final" are NOT padded.
+ *
+ * Important: this helper makes NO claim about lex-sort order across the
+ * literal labels and the numeric ones. ASCII 'i' (0x69) and 'f' (0x66)
+ * both rank above the digits, so `step-init.jpg` and `step-final.jpg`
+ * actually sort AFTER every `step-NNN.jpg` in a lex listing. Sort order
+ * is not load-bearing anywhere in vouch — the dashboard pairs captures
+ * to actions by action_id, not by filename order. If you ever need a
+ * naturally-ordered listing, sort programmatically rather than relying
+ * on the filename.
  *
  * Sharing this between lores + hires guarantees the two captures of the
  * same step have matching filenames apart from extension, which is the
@@ -932,7 +942,7 @@ function watchForAnimationDuringWait(
 function screenshotLabel(stepIdx: number | "init" | "final"): string {
   if (stepIdx === "init") return "init";
   if (stepIdx === "final") return "final";
-  return String(stepIdx).padStart(2, "0");
+  return String(stepIdx).padStart(3, "0");
 }
 
 /**

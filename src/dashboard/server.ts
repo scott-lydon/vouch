@@ -92,7 +92,23 @@ export async function startServer(dbPath: string, port: number): Promise<void> {
   // continuing to the SPA fallback (which would serve index.html under an
   // image content-type and quietly fail in the browser).
   app.use("/runs", (req, res, next) => {
-    const lower = req.path.toLowerCase();
+    // decodeURIComponent is mandatory: Express leaves percent-escapes in
+    // req.path, so a request for /runs/foo%2Epng (encoded `.`) would slip
+    // past a naive endsWith(".png") check on the raw string and then get
+    // happily served by express.static (which DOES decode). The reverse —
+    // a request for /runs/leak%2Emd (encoded `.md`) — would be allowed by
+    // the naive check and then served as text. Decode at the boundary so
+    // the allowlist sees the SAME path express.static will resolve.
+    // Malformed escapes (lone `%`, `%G0`) throw URIError; reject with 400
+    // because that's the request's fault, not the server's (QA W3, 2026-05-24).
+    let decodedPath: string;
+    try {
+      decodedPath = decodeURIComponent(req.path);
+    } catch {
+      res.status(400).type("text/plain").send("Bad request: malformed percent-escape in path.");
+      return;
+    }
+    const lower = decodedPath.toLowerCase();
     if (
       lower.endsWith(".jpg") ||
       lower.endsWith(".jpeg") ||

@@ -491,6 +491,12 @@ const lightbox = (() => {
   let backdrop = null;
   let img = null;
   let caption = null;
+  let closeBtnRef = null;
+  // Element that had focus when the lightbox opened. On close we restore
+  // focus to it so a keyboard user does not lose their place in the step
+  // list (QA W4, 2026-05-24). null when opened from a non-focusable trigger
+  // or when document.activeElement was the body.
+  let lastFocused = null;
 
   function ensureBuilt() {
     if (backdrop) return;
@@ -504,7 +510,7 @@ const lightbox = (() => {
         if (e.target === backdrop) close();
       },
     });
-    const closeBtn = el('button', {
+    closeBtnRef = el('button', {
       class: 'lightbox-close',
       type: 'button',
       'aria-label': 'Close screenshot view',
@@ -512,7 +518,7 @@ const lightbox = (() => {
     }, '×');
     img = el('img', { alt: '' });
     caption = el('div', { class: 'lightbox-caption' });
-    backdrop.appendChild(closeBtn);
+    backdrop.appendChild(closeBtnRef);
     backdrop.appendChild(img);
     backdrop.appendChild(caption);
     document.body.appendChild(backdrop);
@@ -523,10 +529,19 @@ const lightbox = (() => {
 
   function open(url, captionText) {
     ensureBuilt();
+    // Remember the trigger so we can restore focus on close. Guard
+    // against document.activeElement being null (some embedded contexts)
+    // or being the body (no useful focus to restore).
+    const active = document.activeElement;
+    lastFocused = active && active !== document.body ? active : null;
     img.src = url;
     img.alt = captionText || 'Screenshot';
     caption.textContent = captionText || '';
     backdrop.style.display = 'flex';
+    // Move focus into the modal so Escape and Tab behave as expected.
+    // Async focus shift sidesteps any focus the click event was about
+    // to deliver back to the trigger element.
+    setTimeout(() => closeBtnRef && closeBtnRef.focus(), 0);
   }
 
   function close() {
@@ -536,6 +551,13 @@ const lightbox = (() => {
     // the new one loads. Browsers garbage-collect the buffer once the src
     // is cleared.
     img.removeAttribute('src');
+    // Restore focus to the element that opened the lightbox so a keyboard
+    // user resumes where they left off. The element may have been removed
+    // from the DOM in the meantime (route change); guard with isConnected.
+    if (lastFocused && lastFocused.isConnected && typeof lastFocused.focus === 'function') {
+      lastFocused.focus();
+    }
+    lastFocused = null;
   }
 
   return { open };

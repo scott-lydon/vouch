@@ -360,19 +360,31 @@ export function cleanCleanRunScreenshots(db: DBHandle, runId: string): number {
   let deletedCount = 0;
   for (const p of perms) {
     if (flagged.has(p.id)) continue;
-    // Locate this permutation's screenshot dir via the execution's step_log.
     const exec = getExecution(db, p.id);
     if (!exec) continue;
+    // Locate this permutation's screenshot dir from any artifact the
+    // executor wrote: any step's lores OR hires path, OR the post-loop
+    // final-state path. All three live in the same per-perm dir by the
+    // executor's contract (see captureLowResScreenshot / captureHiResScreenshot),
+    // so any one is enough to derive the dirname to rm. The cascade matters
+    // because best-effort capture means any individual path can be null on
+    // a starved-disk run; without considering the final-state path, perms
+    // whose only successful capture was post-loop would leak their dir
+    // forever (QA W2, 2026-05-24).
+    const candidatePaths: Array<string | null> = [];
     for (const step of exec.step_log) {
-      if (!step.screenshot_path) continue;
-      try {
-        const dir = dirname(step.screenshot_path);
-        rmSync(dir, { recursive: true, force: true });
-        deletedCount++;
-        break; // One dir per permutation; rm covers all steps.
-      } catch {
-        // Best-effort cleanup. Don't fail the run on disk errors.
-      }
+      candidatePaths.push(step.screenshot_path);
+      candidatePaths.push(step.screenshot_path_hires);
+    }
+    candidatePaths.push(exec.final_state_screenshot_path);
+    const firstPath = candidatePaths.find((p) => typeof p === "string" && p.length > 0);
+    if (!firstPath) continue;
+    try {
+      const dir = dirname(firstPath);
+      rmSync(dir, { recursive: true, force: true });
+      deletedCount++;
+    } catch {
+      // Best-effort cleanup. Don't fail the run on disk errors.
     }
   }
   return deletedCount;

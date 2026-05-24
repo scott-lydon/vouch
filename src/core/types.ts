@@ -166,14 +166,35 @@ export const ExecutionSchema = z.object({
       ok: z.boolean(),
       error_message: z.string().nullable().default(null),
       /**
-       * Absolute path to the PNG screenshot taken AFTER this step executed.
+       * Absolute path to the LOW-RES JPEG screenshot taken AFTER this step
+       * executed. JPEG quality 60 is the default capture; a 200-step run lands
+       * in the low single-digit MB instead of the 30+ MB the all-PNG mode used.
        * Populated when the executor's screenshot mode is on (default).
        * Cleaned up (deleted from disk) for permutations that complete without
        * any blocking finding, to bound disk usage. Findings analyzer flips
        * to "preserve" for permutations with at least one blocking finding so
        * the dashboard can render the evidence.
+       *
+       * Naming: this field kept its historic name (`screenshot_path`) instead
+       * of being renamed to `screenshot_path_lores` so existing rows in
+       * vouch.db keep parsing without a migration. The path's extension is
+       * authoritative for the format: `.jpg` for the new capture path, `.png`
+       * for any pre-existing rows captured before the 2026-05-24 adaptive
+       * change. Consumers MUST derive media type from the extension, not
+       * assume PNG.
        */
       screenshot_path: z.string().nullable().default(null),
+      /**
+       * Absolute path to the HIGH-RES PNG screenshot of THIS step, written
+       * only when the step itself threw (i.e. ok === false). Captured because
+       * the failing-state screenshot is the most useful evidence an auditor
+       * can eyeball — the lores JPEG is fine for "what step was this" but
+       * loses detail in stack-trace overlays, validation messages, and
+       * tooltip text. Null on every successful step. Stays on disk for the
+       * same lifecycle as `screenshot_path` (cleaned up together when the
+       * findings analyzer prunes a clean perm's directory).
+       */
+      screenshot_path_hires: z.string().nullable().default(null),
     }),
   ),
   /**
@@ -191,6 +212,18 @@ export const ExecutionSchema = z.object({
    * can surface a fix hint instead of a stack trace.
    */
   error_class: z.string().nullable().default(null),
+  /**
+   * Absolute path to a HIGH-RES PNG of the page at the moment all
+   * permutation steps finished (or, for crashing perms, the moment after
+   * the failing step). Captured once per permutation, in addition to the
+   * per-step JPEGs. Why a dedicated final-state shot: a campaign reviewer
+   * almost always wants the END view of a perm at fidelity high enough to
+   * read tooltip text and form-validation messages; reaching that from the
+   * per-step JPEGs alone would require capturing every step at hires, which
+   * the disk budget rules out. Null when screenshot mode is off or capture
+   * threw best-effort.
+   */
+  final_state_screenshot_path: z.string().nullable().default(null),
 });
 export type Execution = z.infer<typeof ExecutionSchema>;
 

@@ -78,14 +78,36 @@ export interface ExecuteOptions {
    */
   permTimeoutMs?: number;
   /**
-   * If set, captures a PNG screenshot after each step into
-   * `<screenshotsDir>/<perm_id>/step-<n>.png`. The findings analyzer is
-   * responsible for cleaning up screenshots from permutations that didn't
-   * produce blocking findings (`cleanCleanRunScreenshots` in findings.ts).
-   * Default OFF when this option is absent; the CLI defaults it ON.
+   * If set, captures screenshots after each step into
+   * `<screenshotsDir>/<perm_id>/step-<n>.<ext>`. Captured adaptively:
+   *
+   *   - Every step: low-res JPEG quality 60 (`step-<n>.jpg`). Small enough
+   *     that a 200-step run stays in the low single-digit MB on disk.
+   *   - Failing steps (where the playStep call threw): an additional
+   *     full-quality PNG of the same state (`step-<n>.png`). The failing
+   *     screenshot is the highest-signal artifact a human auditor reaches
+   *     for; lores JPEG would blur validation messages and stack overlays.
+   *   - Once per permutation, after the last step ran: a final-state PNG
+   *     (`step-final.png`) so the "what does the end look like" review has
+   *     full fidelity without paying hires per step.
+   *
+   * Findings analyzer cleans up screenshot directories for permutations that
+   * produced no blocking findings (`cleanCleanRunScreenshots` in findings.ts);
+   * the cleanup removes the whole perm dir, so the .jpg / .png pair vanishes
+   * together. Default OFF when this option is absent; the CLI defaults it ON.
    */
   screenshotsDir?: string | null;
 }
+
+/**
+ * JPEG quality for the per-step lores capture. 60 strikes the balance the
+ * project's bug-prevention checklist names: small on disk, no perceptible
+ * loss for "did this view look right" eyeballing, leaves enough room for the
+ * downstream sketchy vision model to still pick up UI-level signals. If a
+ * future SUT needs different sensitivity, expose VOUCH_SCREENSHOT_JPEG_QUALITY
+ * before promoting this constant to an Executor option.
+ */
+const SCREENSHOT_JPEG_QUALITY = 60;
 
 const DEFAULT_STEP_TIMEOUT_MS = 8_000;
 const DEFAULT_NAV_TIMEOUT_MS = 15_000;
@@ -254,6 +276,7 @@ async function executeOneCapped(
       started_at: startedAt,
       finished_at: new Date().toISOString(),
       error_class: "context_create_failed",
+      final_state_screenshot_path: null,
     };
   }
 
@@ -316,6 +339,7 @@ async function executeOneCapped(
         started_at: startedAt,
         finished_at: new Date().toISOString(),
         error_class: "perm_wallclock_exceeded",
+        final_state_screenshot_path: null,
       });
     }, permTimeoutMs);
   });
@@ -384,6 +408,7 @@ async function executeOneInContext(
       started_at: startedAt,
       finished_at: finishedAt,
       error_class: errorClass,
+      final_state_screenshot_path: null,
     };
   }
   // Settle: same hydration wait the Surface Mapper does after goto. Without
@@ -408,12 +433,16 @@ async function executeOneInContext(
   //      only way the dashboard can show "before vs after" for the SUT,
   //      which is the most useful regression-diff a human can eyeball.
   //
-  // We write it as `step-init.png` (sortable before any `step-00.png`) and
+  // We write it as `step-init.jpg` (sortable before any `step-00.jpg`) and
   // record it in the step_log with action_id="__init__" and ok=true so the
   // findings analyzer + sketchy phase can locate it via the same lookup
   // path it uses for ordinary steps. ok=true keeps the verdict pass-able;
   // a non-pass would lie about whether the SUT crashed.
-  const initShotPath = await maybeScreenshot(page, screenshotsDir, perm.id, "init");
+  //
+  // Init shot is lores-only by policy: the landing page rarely needs hires
+  // for the per-step audit (a final-state hires PNG is captured later, after
+  // the loop, which covers "what did the page end up looking like").
+  const initShotPath = await captureLowResScreenshot(page, screenshotsDir, perm.id, "init");
   if (initShotPath !== null) {
     stepLog.push({
       action_id: "__init__",
@@ -423,6 +452,7 @@ async function executeOneInContext(
       ok: true,
       error_message: null,
       screenshot_path: initShotPath,
+      screenshot_path_hires: null,
     });
   }
 
@@ -440,6 +470,7 @@ async function executeOneInContext(
         ok: false,
         error_message: `Unknown action id '${actionId}' (not present in this run's actions table).`,
         screenshot_path: null,
+        screenshot_path_hires: null,
       });
       verdict = "infrastructure_error";
       errorClass = "unknown_action_id";
@@ -461,7 +492,13 @@ async function executeOneInContext(
       verdict = isTimeout ? "timeout" : "fail";
       errorClass = isTimeout ? "playwright_timeout" : "playwright_action_error";
     }
-    const shotPath = await maybeScreenshot(page, screenshotsDir, perm.id, stepIdx);
+    // Lores JPEG every step (cheap). Hires PNG only when the step threw —
+    // a failing step is exactly when an auditor needs to read overlay text
+    // (validation errors, stack traces, tooltips) that lores would blur.
+    const loPath = await captureLowResScreenshot(page, screenshotsDir, perm.id, stepIdx);
+    const hiPath = stepOk
+      ? null
+      : await captureHiResScreenshot(page, screenshotsDir, perm.id, stepIdx);
     stepLog.push({
       action_id: actionId,
       kind: action.kind,
@@ -469,11 +506,22 @@ async function executeOneInContext(
       finished_at: new Date().toISOString(),
       ok: stepOk,
       error_message: stepErr,
-      screenshot_path: shotPath,
+      screenshot_path: loPath,
+      screenshot_path_hires: hiPath,
     });
     stepIdx++;
     if (!stepOk) break;
   }
+
+  // Final-state hires PNG. Capture ONCE per permutation, regardless of
+  // verdict, so the dashboard's "what does this perm end up looking like"
+  // panel always has a high-fidelity view. The page is still open here
+  // (executeOneCapped owns ctx.close); observePostState runs immediately
+  // after so the timing window is symmetric with the text-summary capture.
+  // Best-effort: if the capture throws (force-closed context after a crash),
+  // we keep going and write a null path. Crashing perms still have the
+  // per-step hires from the failing step, so this null is not catastrophic.
+  const finalHiresPath = await captureHiResScreenshot(page, screenshotsDir, perm.id, "final");
 
   observedPostState = await observePostState(page);
   const finishedAt = new Date().toISOString();
@@ -486,6 +534,7 @@ async function executeOneInContext(
     started_at: startedAt,
     finished_at: finishedAt,
     error_class: errorClass,
+    final_state_screenshot_path: finalHiresPath,
   };
 }
 
@@ -869,33 +918,108 @@ function watchForAnimationDuringWait(
 }
 
 /**
- * Capture a PNG after the given step ran. Returns absolute path on disk or
- * null if screenshots are off. We always try the capture even when the step
- * threw — the screenshot of the failed state is the most useful evidence.
+ * Step-index label used by both lores and hires capture paths. Numeric
+ * indexes pad to two digits so lexicographic sort matches numeric sort
+ * (step-00, step-01, ... step-99). The literal labels "init" and "final"
+ * are NOT padded and they intentionally land at the boundaries of any
+ * sorted listing: "init" < "00" and "99" < "final".
+ *
+ * Sharing this between lores + hires guarantees the two captures of the
+ * same step have matching filenames apart from extension, which is the
+ * invariant the dashboard relies on when it links a JPEG thumbnail to its
+ * PNG hires sibling.
  */
-async function maybeScreenshot(
-  page: import("playwright").Page,
-  screenshotsDir: string | null,
-  permId: string,
-  /**
-   * Numeric step index (0,1,2,...) for post-step captures, or the literal
-   * string "init" for the post-navigation baseline. Distinct filenames so
-   * sortable listings put init first (`step-init.png` < `step-00.png` by
-   * lexicographic ordering when "init" is treated as a label, which is why
-   * we DO NOT pad it to two digits).
-   */
-  stepIdx: number | "init",
-): Promise<string | null> {
+function screenshotLabel(stepIdx: number | "init" | "final"): string {
+  if (stepIdx === "init") return "init";
+  if (stepIdx === "final") return "final";
+  return String(stepIdx).padStart(2, "0");
+}
+
+/**
+ * Ensure the per-permutation screenshot directory exists and return its
+ * absolute path, or null if screenshots are disabled at the run level. We
+ * call mkdirSync recursively so concurrent perms creating sibling dirs do
+ * not race. Pulled out of the capture helpers so both lores and hires use
+ * the SAME directory — they MUST share a dir for the dashboard's
+ * "matching filename, swapped extension" pairing to work.
+ */
+function ensureShotDir(screenshotsDir: string | null, permId: string): string | null {
   if (!screenshotsDir) return null;
   const dir = resolve(screenshotsDir, permId);
   try {
     mkdirSync(dir, { recursive: true });
-    const label = stepIdx === "init" ? "init" : String(stepIdx).padStart(2, "0");
-    const path = resolve(dir, `step-${label}.png`);
-    await page.screenshot({ path, fullPage: false, timeout: 5_000 });
+    return dir;
+  } catch {
+    // Best-effort. If the disk is unwritable here, all downstream captures
+    // will also fail; the caller's try/catch handles each one independently
+    // and returns null so the run keeps marching.
+    return null;
+  }
+}
+
+/**
+ * Capture a LOW-RES JPEG (quality `SCREENSHOT_JPEG_QUALITY`) after the given
+ * step ran. Returns the absolute path on disk or null if screenshots are
+ * off / the capture threw. Always-on per the adaptive policy: every step's
+ * lores shot is the dashboard's default thumbnail.
+ *
+ * Why JPEG and not PNG: a viewport-sized UI screenshot at PNG averaged
+ * ~68 KB per step in pre-2026-05-24 runs; the same shot at JPEG q60 lands
+ * in the 8 to 20 KB range. Over a 200-step run that's the difference
+ * between 14 MB and 3 MB on disk, and the disk grows linearly per run.
+ */
+async function captureLowResScreenshot(
+  page: import("playwright").Page,
+  screenshotsDir: string | null,
+  permId: string,
+  stepIdx: number | "init" | "final",
+): Promise<string | null> {
+  const dir = ensureShotDir(screenshotsDir, permId);
+  if (!dir) return null;
+  try {
+    const path = resolve(dir, `step-${screenshotLabel(stepIdx)}.jpg`);
+    await page.screenshot({
+      path,
+      fullPage: false,
+      type: "jpeg",
+      quality: SCREENSHOT_JPEG_QUALITY,
+      timeout: 5_000,
+    });
     return path;
   } catch {
     // Best-effort. A screenshot failure should never poison the run.
+    return null;
+  }
+}
+
+/**
+ * Capture a HIGH-RES PNG after the given step ran. Used ONLY in two
+ * situations:
+ *
+ *   1. A step's action threw (the lores JPEG of the same step exists; the
+ *      hires PNG sits next to it so the auditor can read overlay text the
+ *      JPEG would blur).
+ *   2. Post-loop final-state shot (label "final"), so the "what does the
+ *      end of this perm look like" review always has full fidelity.
+ *
+ * Returns the absolute path on disk or null if screenshots are off / the
+ * capture threw. Same best-effort policy as the lores path: a screenshot
+ * failure must never poison the run.
+ */
+async function captureHiResScreenshot(
+  page: import("playwright").Page,
+  screenshotsDir: string | null,
+  permId: string,
+  stepIdx: number | "init" | "final",
+): Promise<string | null> {
+  const dir = ensureShotDir(screenshotsDir, permId);
+  if (!dir) return null;
+  try {
+    const path = resolve(dir, `step-${screenshotLabel(stepIdx)}.png`);
+    await page.screenshot({ path, fullPage: false, timeout: 5_000 });
+    return path;
+  } catch {
+    // Best-effort.
     return null;
   }
 }

@@ -94,10 +94,40 @@ export function detectSketchySource(): SketchySource {
 }
 
 /**
- * Read a PNG from disk and base64-encode it for the Anthropic vision API.
- * Throws with a clear hint if the file is missing — the executor is
- * supposed to have written it just before this call, so a missing file is
- * an executor bug, not a user-actionable problem.
+ * Anthropic's vision API media_type for a screenshot, derived from the file
+ * extension. Wrong here would have the API silently misinterpret the bytes
+ * (the 2026-05-24 adaptive-screenshot change switched the executor's default
+ * capture from PNG to JPEG; before this helper landed, sketchy.ts hardcoded
+ * "image/png" and would have shipped JPEG bytes under a PNG label).
+ *
+ * Throws on unsupported extensions rather than defaulting silently, so a
+ * future format addition (webp, gif) surfaces as a loud failure at the
+ * boundary instead of as a confusing vision-model response.
+ */
+export type AnthropicImageMediaType = "image/jpeg" | "image/png" | "image/gif" | "image/webp";
+
+export function mediaTypeForScreenshot(path: string): AnthropicImageMediaType {
+  // Lowercase extension lookup; case-insensitive because Playwright writes
+  // the extension we passed but the path can be re-derived from user input.
+  const lower = path.toLowerCase();
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".gif")) return "image/gif";
+  if (lower.endsWith(".webp")) return "image/webp";
+  throw new Error(
+    `sketchy: cannot derive Anthropic media_type for screenshot path '${path}'. ` +
+      `Supported extensions: .jpg / .jpeg / .png / .gif / .webp. ` +
+      `The executor should have written one of these; check the screenshot capture in executor.ts.`,
+  );
+}
+
+/**
+ * Read a screenshot from disk and base64-encode it for the Anthropic vision
+ * API. Format-agnostic — see `mediaTypeForScreenshot` for the format
+ * derivation that pairs with this call. Throws with a clear hint if the
+ * file is missing — the executor is supposed to have written it just before
+ * this call, so a missing file is an executor bug, not a user-actionable
+ * problem.
  */
 function readImageBase64(path: string): string {
   let raw: Buffer;
@@ -241,6 +271,7 @@ export async function checkScreenshotForSketchiness(
   const client = new Anthropic({ apiKey });
 
   const imageBase64 = readImageBase64(input.screenshotPath);
+  const mediaType = mediaTypeForScreenshot(input.screenshotPath);
   const { system, userText } = buildSketchyPromptContent(input);
 
   const resp = await client.messages.create({
@@ -261,7 +292,7 @@ export async function checkScreenshotForSketchiness(
             type: "image",
             source: {
               type: "base64",
-              media_type: "image/png",
+              media_type: mediaType,
               data: imageBase64,
             },
           },

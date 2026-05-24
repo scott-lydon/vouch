@@ -714,15 +714,33 @@ async function runMissingPhases(input: RunMissingPhasesInputs): Promise<void> {
       if (getSketchyVerdict(db, perm.id)) continue;
       const execution = getExecution(db, perm.id);
       if (!execution) continue; // executor failed for this perm; nothing to look at.
-      // Pick the LAST step that has a screenshot_path. Walking in reverse
-      // skips per-step screenshots from earlier steps so we evaluate the
-      // final visible state.
-      let shotPath: string | null = null;
-      for (let i = execution.step_log.length - 1; i >= 0; i--) {
-        const step = execution.step_log[i]!;
-        if (step.screenshot_path) {
-          shotPath = step.screenshot_path;
-          break;
+      // Path-preference cascade (best-signal-first):
+      //   1. final_state_screenshot_path — hires PNG of the page right after
+      //      the last step ran. Captured once per perm by the executor's
+      //      post-loop pass. This is the cleanest "end of perm" view the
+      //      vision model can see; prefer it whenever it exists.
+      //   2. Last step's screenshot_path_hires — present only on failing
+      //      steps. If the perm crashed mid-sequence, this is the failing
+      //      state at full fidelity.
+      //   3. Last step's screenshot_path — lores JPEG fallback. Always
+      //      present on a normally-captured run; the vision model still
+      //      handles JPEG fine, just with less detail in overlay text.
+      //
+      // Walking step_log in reverse so we catch the LAST hires-or-lores
+      // step rather than the first one (the final visible state matters
+      // for sketchy detection, not the landing page).
+      let shotPath: string | null = execution.final_state_screenshot_path ?? null;
+      if (!shotPath) {
+        for (let i = execution.step_log.length - 1; i >= 0; i--) {
+          const step = execution.step_log[i]!;
+          if (step.screenshot_path_hires) {
+            shotPath = step.screenshot_path_hires;
+            break;
+          }
+          if (step.screenshot_path) {
+            shotPath = step.screenshot_path;
+            break;
+          }
         }
       }
       if (!shotPath) continue;

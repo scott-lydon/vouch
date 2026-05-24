@@ -15,6 +15,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   buildSketchyPromptContent,
   detectSketchySource,
+  mediaTypeForScreenshot,
   parseSketchyReply,
   type SketchyCheckInputs,
 } from "./sketchy.js";
@@ -157,5 +158,44 @@ describe("parseSketchyReply", () => {
     const out = parseSketchyReply("verdict: Sketchy\nIssues:\n- alpha\n");
     expect(out.verdict).toBe("sketchy");
     expect(out.issues).toEqual(["alpha"]);
+  });
+});
+
+// ----------------------------------------------------------------------------
+// 4. mediaTypeForScreenshot — guards against the 2026-05-24 regression where
+//    sketchy.ts hardcoded "image/png" while the executor wrote JPEGs. The
+//    mismatch would have shipped JPEG bytes under a PNG content-type header
+//    and the Anthropic vision API would silently reject or misinterpret them.
+//    Pin every extension we expect to encounter and lock in the loud failure
+//    on anything else so a future capture-format change can't silently break
+//    the vision path again.
+// ----------------------------------------------------------------------------
+
+describe("mediaTypeForScreenshot", () => {
+  it("maps .jpg to image/jpeg", () => {
+    expect(mediaTypeForScreenshot("/runs/abc/screenshots/perm_001/step-00.jpg")).toBe("image/jpeg");
+  });
+
+  it("maps .jpeg to image/jpeg", () => {
+    expect(mediaTypeForScreenshot("/tmp/foo.jpeg")).toBe("image/jpeg");
+  });
+
+  it("maps .png to image/png", () => {
+    expect(mediaTypeForScreenshot("/runs/abc/screenshots/perm_001/step-final.png")).toBe("image/png");
+  });
+
+  it("is case-insensitive on the extension", () => {
+    expect(mediaTypeForScreenshot("/runs/X/STEP-00.JPG")).toBe("image/jpeg");
+    expect(mediaTypeForScreenshot("/runs/X/STEP-00.PNG")).toBe("image/png");
+  });
+
+  it("maps .gif and .webp for completeness (the API accepts them)", () => {
+    expect(mediaTypeForScreenshot("/tmp/a.gif")).toBe("image/gif");
+    expect(mediaTypeForScreenshot("/tmp/a.webp")).toBe("image/webp");
+  });
+
+  it("throws loudly on an unknown extension instead of silently defaulting", () => {
+    expect(() => mediaTypeForScreenshot("/tmp/a.bmp")).toThrow(/cannot derive Anthropic media_type/);
+    expect(() => mediaTypeForScreenshot("/tmp/a")).toThrow(/cannot derive Anthropic media_type/);
   });
 });

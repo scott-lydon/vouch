@@ -6,6 +6,23 @@ When delegating to `claude-code-bridge` or the QA gate, brief the implementing a
 
 ---
 
+## Shipped (out-of-sequence) — Adaptive screenshot capture + dashboard click-to-view
+
+> Operator-reported gap: the executor was writing one PNG per step at native viewport (~68 KB each, 30+ MB per run), and the dashboard never surfaced any of them — reviewing a permutation meant browsing the runs/ filesystem by hand. Closing the loop turns "what did this perm look like at step N" from a filesystem dive into a click. Spec stories served: review-loop fluency for any executed run (cross-cuts every US story that produces an Execution row). Plan components touched: Executor (screenshot capture), Findings (cleanup unchanged), Dashboard server + UI.
+
+- [x] Executor: capture lores JPEG quality 60 every step (`step-<n>.jpg`), additionally capture hires PNG on failing steps (`step-<n>.png`), additionally capture a post-loop final-state hires PNG (`step-final.png`). Both lo and hi paths propagated in `step_log`; final-state path on the Execution row.
+- [x] Types: add `screenshot_path_hires` to step_log items and `final_state_screenshot_path` to Execution, both nullable with default null so existing vouch.db rows keep parsing.
+- [x] Sketchy: derive Anthropic media_type from the screenshot path extension instead of hardcoding `image/png`. Pin behavior with 6 new unit tests (`mediaTypeForScreenshot`).
+- [x] Sketchy selector in cli.ts: prefer `final_state_screenshot_path` over per-step hires over per-step lores when picking the vision model's input.
+- [x] Dashboard server: scoped `/runs/:runId/screenshots/...` static route with extension allowlist (`.jpg`/`.jpeg`/`.png` only) so `*.findings.md` and `vouch.db` cannot leak through. Per-perm response enriched with `step_screenshots` and `final_state_screenshot` URLs derived from absolute paths.
+- [x] Dashboard UI: per-step thumbnail inside each step's `<details>` body with HD badge when a hires sibling exists. Init + final-state thumbnail bookend the step list. Click any thumbnail to open a singleton lightbox overlay; backdrop, close button, or Escape dismisses.
+- [x] Done-criteria check: typecheck clean, all 65 non-DB tests pass (the 9 DB-test failures in the sandbox are an `invalid ELF header` mismatch between the macOS-native better-sqlite3 binary and the Linux sandbox runtime — they pass on the user's actual Mac).
+- [x] Bug-prevention checklist updated (see `BUG_PREVENTION.md` in this repo).
+- [ ] **QA gate**: invoke `qa-adversary` via `claude-code-bridge` against the diff.
+- [ ] Dual-push commit to GitHub + GitLab origin.
+
+---
+
 ## Current slice — Slice 1: CLI scaffold + NDJSON protocol skeleton
 
 > Spec stories served: foundation for US-01 through US-13. Plan components touched: §1 CLI, §2 protocol contract. Rubric: Architecture (boundary definition).

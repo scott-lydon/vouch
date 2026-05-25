@@ -168,20 +168,6 @@ details.step-row[open] > summary > span.text-xs { opacity: 0 !important; }
   display: block;
   transition: flex-grow 0.2s ease;
 }
-.run-breakdown-legend {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 12px;
-  margin-top: 6px;
-  font-size: 0.75rem;
-}
-.run-breakdown-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-weight: 500;
-}
 .run-breakdown-dot {
   display: inline-block;
   width: 8px;

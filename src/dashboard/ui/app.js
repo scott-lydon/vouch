@@ -345,7 +345,7 @@ function renderRunRow(r) {
   const finished = !!r.finished_at;
   const shortId = r.id.length > 28 ? r.id.slice(0, 28) + '…' : r.id;
   const shortSha = r.spec_sha256 ? r.spec_sha256.slice(0, 7) : '—';
-  const breakdown = runBreakdownInline(r.summary);
+  const breakdown = runBreakdown(r.summary);
   return el(
     'a',
     {
@@ -374,7 +374,7 @@ function renderRunRow(r) {
           el('span', { class: 'run-row-rel' }, ` · ${fmtRelative(r.started_at)}`),
         ]),
       ]),
-      // Row 2: bar + inline chips. runBreakdownInline returns null when there
+      // Row 2: bar + inline chips. runBreakdown returns null when there
       // are no permutations yet so the row collapses cleanly.
       breakdown,
       // Row 3: target url + identifiers, muted and tiny. Truncates the URL
@@ -393,17 +393,18 @@ function renderRunRow(r) {
 }
 
 /**
- * Compact inline variant of {@link runBreakdown} used by the runs list.
- * Same four-tier model (verified / with_concerns / issues / not_executed),
- * but the bar and the chips share a single row: bar on the left with
- * flex-grow, chips packed on the right. Tooltips on each segment AND each
- * chip carry the full "label: count / total (pct%)" string so hover gives
- * the operator the unabridged number without inflating the row height.
+ * Per-run breakdown bar + tier chips, rendered on a single line. Four
+ * tiers match the server's RunSummary (src/core/run-summary.ts) one-for-
+ * one: verified (green), with_concerns (yellow), issues (red),
+ * not_executed (gray). The bar sits on the left with flex-grow; the chips
+ * pack on the right. Tooltips on each segment AND each chip carry the
+ * full "label: count / total (pct%)" string so hover surfaces the
+ * unabridged number without inflating the row height.
  *
- * Returns null when summary is missing or the run has zero permutations so
- * the row collapses to header + footer with no awkward blank bar.
+ * Returns null when summary is missing or the run has zero permutations
+ * so the row collapses to header + footer with no awkward blank bar.
  */
-function runBreakdownInline(summary) {
+function runBreakdown(summary) {
   if (!summary) return null;
   const total = summary.permutations;
   if (total === 0) {
@@ -450,79 +451,6 @@ function runBreakdownInline(summary) {
     el('div', { class: 'run-row-chips' }, [
       el('span', { class: 'muted run-row-total' }, `${total}`),
       ...chips,
-    ]),
-  ]);
-}
-
-/**
- * Render the per-run breakdown bar on a project-list tile. Four tiers must
- * match the server's RunSummary (src/core/run-summary.ts) one-for-one:
- *   verified      — green segment, "passed cleanly"
- *   with_concerns — yellow segment, "ran but is not pristine"
- *   issues        — red segment, "crashed or LLM-confirmed bug candidate"
- *   not_executed  — gray segment, "executor hasn't replayed yet"
- *
- * Renders the stacked bar (zero-width segments are omitted so the bar does
- * not get visual noise) and a single inline legend with count + percentage
- * per tier. When the run has zero permutations (planner produced nothing
- * yet), we render a muted explanation instead of a 0%-wide bar.
- *
- * Returns null when summary is missing (defensive — an older row could be
- * pre-summary) so the caller's children list stays clean.
- */
-function runBreakdown(summary) {
-  if (!summary) return null;
-  const total = summary.permutations;
-  if (total === 0) {
-    return el('div', { class: 'muted text-xs mt-3' },
-      'No permutations were generated for this run.');
-  }
-  // Tier-order is intentional: verified first (the operator wants to see how
-  // much is green at a glance), then with_concerns, then issues, then the
-  // not-executed tail. This matches the wraparound on the run detail page
-  // and reads as "good → questionable → broken → pending."
-  const tiers = [
-    { key: 'verified',      label: 'verified',      cssVar: 'var(--good)' },
-    { key: 'with_concerns', label: 'with concerns', cssVar: 'var(--warn)' },
-    { key: 'issues',        label: 'issues',        cssVar: 'var(--bad)' },
-    { key: 'not_executed',  label: 'not executed',  cssVar: 'var(--muted)' },
-  ];
-
-  // The bar. Use flex-grow proportional to count so widths reflect the
-  // ratio exactly without depending on the rounded `percentages` numbers
-  // (those are for display only). Segments with zero count are omitted so
-  // the bar has no invisible-but-bordered slivers.
-  const segments = tiers
-    .filter((t) => (summary.counts[t.key] ?? 0) > 0)
-    .map((t) => el('span', {
-      class: 'run-breakdown-seg',
-      style: `flex-grow: ${summary.counts[t.key]}; background: ${t.cssVar};`,
-      title: `${t.label}: ${summary.counts[t.key]} / ${total} (${summary.percentages[t.key]}%)`,
-    }));
-
-  // The legend. One chip per tier with a non-zero count. Each chip carries
-  // the count AND the percentage so the operator can read either without
-  // recomputing. Zero-count tiers are dropped from the legend to keep it
-  // scannable on small cards.
-  const legendChips = tiers
-    .filter((t) => (summary.counts[t.key] ?? 0) > 0)
-    .map((t) => el('span', { class: 'run-breakdown-chip', style: `color: ${t.cssVar};` }, [
-      el('span', { class: 'run-breakdown-dot', style: `background: ${t.cssVar};` }),
-      `${summary.counts[t.key]} ${t.label} (${summary.percentages[t.key]}%)`,
-    ]));
-
-  return el('div', { class: 'mt-3' }, [
-    el('div', {
-      class: 'run-breakdown-bar',
-      role: 'img',
-      'aria-label': `Run breakdown: ${tiers
-        .filter((t) => (summary.counts[t.key] ?? 0) > 0)
-        .map((t) => `${summary.counts[t.key]} ${t.label}`)
-        .join(', ')} of ${total} permutations`,
-    }, segments),
-    el('div', { class: 'run-breakdown-legend' }, [
-      el('span', { class: 'muted text-xs' }, `${total} permutation${total === 1 ? '' : 's'} · `),
-      ...legendChips,
     ]),
   ]);
 }

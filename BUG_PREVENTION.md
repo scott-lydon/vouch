@@ -45,3 +45,24 @@ The findings cleanup pass still removes per-perm dirs for clean perms, so the lo
 **How to detect the next instance.** Any time the API response shape adds a new path-shaped field, ask: "could this be an absolute filesystem path? Does the UI know how to render it as a URL? What happens when the file is gone but the row remains?"
 
 **Test coverage that locks it.** No automated test yet; the failure mode would surface as `404 /Users/...` or `403 /opt/...` requests in the browser console. Worth adding an integration test that hits the perms endpoint and asserts every screenshot URL starts with `/runs/`.
+
+---
+
+## V4. `noUncheckedIndexedAccess` + array indexing in tests
+
+**Rule.** This repo's `tsconfig.json` has `"noUncheckedIndexedAccess": true`, so `array[i]` narrows to `T | undefined`. Test bodies that loop with `for (let i = 0; ...)` and reach into a freshly-constructed array (`perms[i].id`) will fail typecheck with `TS2532: Object is possibly 'undefined'` on every callsite — even when the array's length was just established two lines above.
+
+**Vouch manifestation (2026-05-24).** `src/core/run-summary.test.ts` sized the `perms` array to 10 and then indexed it 10 times in the same test body to set up each tier. `tsc --noEmit` rejected every `perms[i].id` with TS2532, even though the assertion was obviously safe.
+
+**Fix shape.** Extract a tiny helper bound to the local array, with a single non-null assertion inside it. The helper documents the assumption ("perms was just constructed; the index is in range") and stops the `!` from leaking across the rest of the test:
+
+```ts
+const idAt = (i: number): string => perms[i]!.id;
+upsertExecution(db, execStub({ permutation_id: idAt(4) }));
+```
+
+Three reasons not to sprinkle `perms[i]!` at every callsite: (a) the `!` is invisible noise that buries the actual setup; (b) one missing `!` produces an unrelated TS2532 you have to chase; (c) the helper gives the assumption a name so a future reader does not wonder whether the `!` is load-bearing.
+
+**How to detect the next instance.** Any time a test pre-sizes an array and then walks it by integer index in the same body, prefer `for (const p of arr)` or extract an `xAt(i)` helper. If the test must use the integer to do something other than index (e.g., the integer is the perm position itself), the helper pattern wins; otherwise prefer destructuring or `for..of`.
+
+**Test coverage that locks it.** `npm run typecheck` in CI; any regression to bare `array[i].field` reads in test files surfaces as a TS2532 error before the test even runs.

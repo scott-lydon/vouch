@@ -183,6 +183,7 @@ async function viewProject(projectId) {
               el('strong', {}, fmtLocal(r.started_at)),
               el('span', { class: 'muted' }, ` · ${r.target_url}`),
             ]),
+            runBreakdown(r.summary),
             el('div', { class: 'muted text-xs mt-2' }, `id: ${r.id} · spec sha=${r.spec_sha256}`),
           ])
         )
@@ -333,6 +334,79 @@ function statCard(label, value, badgeClass) {
   return el('div', { class: 'panel p-4 text-center' }, [
     el('div', { class: 'text-2xl font-bold accent-text' }, String(value)),
     el('div', { class: 'text-xs muted mt-1' }, label),
+  ]);
+}
+
+/**
+ * Render the per-run breakdown bar on a project-list tile. Four tiers must
+ * match the server's RunSummary (src/core/run-summary.ts) one-for-one:
+ *   verified      — green segment, "passed cleanly"
+ *   with_concerns — yellow segment, "ran but is not pristine"
+ *   issues        — red segment, "crashed or LLM-confirmed bug candidate"
+ *   not_executed  — gray segment, "executor hasn't replayed yet"
+ *
+ * Renders the stacked bar (zero-width segments are omitted so the bar does
+ * not get visual noise) and a single inline legend with count + percentage
+ * per tier. When the run has zero permutations (planner produced nothing
+ * yet), we render a muted explanation instead of a 0%-wide bar.
+ *
+ * Returns null when summary is missing (defensive — an older row could be
+ * pre-summary) so the caller's children list stays clean.
+ */
+function runBreakdown(summary) {
+  if (!summary) return null;
+  const total = summary.permutations;
+  if (total === 0) {
+    return el('div', { class: 'muted text-xs mt-3' },
+      'No permutations were generated for this run.');
+  }
+  // Tier-order is intentional: verified first (the operator wants to see how
+  // much is green at a glance), then with_concerns, then issues, then the
+  // not-executed tail. This matches the wraparound on the run detail page
+  // and reads as "good → questionable → broken → pending."
+  const tiers = [
+    { key: 'verified',      label: 'verified',      cssVar: 'var(--good)' },
+    { key: 'with_concerns', label: 'with concerns', cssVar: 'var(--warn)' },
+    { key: 'issues',        label: 'issues',        cssVar: 'var(--bad)' },
+    { key: 'not_executed',  label: 'not executed',  cssVar: 'var(--muted)' },
+  ];
+
+  // The bar. Use flex-grow proportional to count so widths reflect the
+  // ratio exactly without depending on the rounded `percentages` numbers
+  // (those are for display only). Segments with zero count are omitted so
+  // the bar has no invisible-but-bordered slivers.
+  const segments = tiers
+    .filter((t) => (summary.counts[t.key] ?? 0) > 0)
+    .map((t) => el('span', {
+      class: 'run-breakdown-seg',
+      style: `flex-grow: ${summary.counts[t.key]}; background: ${t.cssVar};`,
+      title: `${t.label}: ${summary.counts[t.key]} / ${total} (${summary.percentages[t.key]}%)`,
+    }));
+
+  // The legend. One chip per tier with a non-zero count. Each chip carries
+  // the count AND the percentage so the operator can read either without
+  // recomputing. Zero-count tiers are dropped from the legend to keep it
+  // scannable on small cards.
+  const legendChips = tiers
+    .filter((t) => (summary.counts[t.key] ?? 0) > 0)
+    .map((t) => el('span', { class: 'run-breakdown-chip', style: `color: ${t.cssVar};` }, [
+      el('span', { class: 'run-breakdown-dot', style: `background: ${t.cssVar};` }),
+      `${summary.counts[t.key]} ${t.label} (${summary.percentages[t.key]}%)`,
+    ]));
+
+  return el('div', { class: 'mt-3' }, [
+    el('div', {
+      class: 'run-breakdown-bar',
+      role: 'img',
+      'aria-label': `Run breakdown: ${tiers
+        .filter((t) => (summary.counts[t.key] ?? 0) > 0)
+        .map((t) => `${summary.counts[t.key]} ${t.label}`)
+        .join(', ')} of ${total} permutations`,
+    }, segments),
+    el('div', { class: 'run-breakdown-legend' }, [
+      el('span', { class: 'muted text-xs' }, `${total} permutation${total === 1 ? '' : 's'} · `),
+      ...legendChips,
+    ]),
   ]);
 }
 

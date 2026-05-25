@@ -147,3 +147,44 @@ details.step-row[open] > summary > span.text-xs { opacity: 0 !important; }
 .lightbox-backdrop .lightbox-caption { position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--panel); border: 1px solid var(--border); color: var(--text); font-size: 0.8rem; padding: 6px 12px; border-radius: 999px; }
 .lightbox-backdrop .lightbox-close { position: absolute; top: 16px; right: 16px; background: var(--panel); border: 1px solid var(--border); color: var(--text); font-size: 1rem; width: 36px; height: 36px; border-radius: 999px; cursor: pointer; }
 .lightbox-backdrop .lightbox-close:hover { border-color: var(--accent2); color: var(--accent2); }
+
+/* Run-tile breakdown bar on the project view.
+ * Stacked horizontal bar where each segment's width is its share of the
+ * run's permutations. Mirrors the four primary-verdict tiers from
+ * src/core/run-summary.ts (verified / with_concerns / issues / not_executed).
+ * The legend underneath surfaces the absolute count AND the percentage for
+ * each non-zero tier so the operator can read either at a glance. */
+.run-breakdown-bar {
+  display: flex;
+  width: 100%;
+  height: 8px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+}
+.run-breakdown-seg {
+  height: 100%;
+  display: block;
+  transition: flex-grow 0.2s ease;
+}
+.run-breakdown-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  margin-top: 6px;
+  font-size: 0.75rem;
+}
+.run-breakdown-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 500;
+}
+.run-breakdown-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+}

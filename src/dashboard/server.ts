@@ -30,6 +30,7 @@ import {
   updatePredictionNote,
 } from "../core/db.js";
 import { analyzeRun, renderFindingsMarkdown } from "../core/findings.js";
+import { summarizeRun, type RunSummary } from "../core/run-summary.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = resolve(__dirname, "ui");
@@ -135,7 +136,17 @@ export async function startServer(dbPath: string, port: number): Promise<void> {
       return;
     }
     const runs = listRunsForProject(db, project.id);
-    res.json({ project, runs });
+    // Enrich each run with the per-tier breakdown used by the project tile.
+    // Three queries per run (perms + per-perm execution + per-perm
+    // expectation) at low cardinalities, so we compute on every request
+    // instead of caching — keeps the UI honest: the moment a row in the
+    // executions or expectation_verdicts table changes, the next page load
+    // reflects it.
+    const enriched: Array<Record<string, unknown>> = runs.map((r) => {
+      const summary: RunSummary = summarizeRun(db, r.id);
+      return { ...r, summary };
+    });
+    res.json({ project, runs: enriched });
   });
 
   app.get("/api/runs/:runId", (req, res) => {

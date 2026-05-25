@@ -11,6 +11,7 @@ import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
+import { REDACTED_TYPE_VALUE } from "./inputs.js";
 import {
   type Action,
   ActionSchema,
@@ -265,13 +266,48 @@ export function insertActions(db: DBHandle, runId: string, actions: Action[]): v
   );
   const tx = db.raw.transaction((rows: Action[]) => {
     for (const a of rows) {
+      // Secrets-at-rest contract:
+      //   When an action is `meta.sensitive=true`, the catalog-resolved
+      //   value (from `*_from_env`) is in `a.type_value`. That raw value
+      //   MUST NOT reach the SQLite file. We replace it with a stable
+      //   sentinel here at the persistence boundary. The executor looks up
+      //   the real value from the in-memory `InputCatalog` at type-time
+      //   using `meta.catalog_entry_name`.
+      //
+      //   Guard: a sensitive action without `meta.catalog_entry_name` would
+      //   be unrecoverable at execute time. Throw at INSERT so the bug
+      //   surfaces here, not on permutation 47 when Playwright is already
+      //   running.
+      //
+      //   Why this lives in the persistence layer and not in surface.ts:
+      //   the surface mapper genuinely needs the resolved value on the
+      //   Action object so in-memory consumers (preview UI, dry-run
+      //   renderer) can show the wired-up sequence. The asymmetry is
+      //   "in memory: real value, on disk / over the wire: sentinel only",
+      //   and the cleanest place to enforce that asymmetry is right where
+      //   the on-disk write happens.
+      const isSensitive = a.meta?.["sensitive"] === true;
+      let typeValueForStorage: string | null = a.type_value;
+      if (isSensitive) {
+        const entryName = a.meta?.["catalog_entry_name"];
+        if (typeof entryName !== "string" || entryName.length === 0) {
+          throw new Error(
+            `db.insertActions: action '${a.id}' has meta.sensitive=true but no ` +
+              `meta.catalog_entry_name. The executor would have no way to resolve the ` +
+              `real value at type-time, and the secret cannot be persisted. ` +
+              `Fix the surface mapper so that any meta.sensitive action also carries ` +
+              `meta.catalog_entry_name (see realVariantFor in src/core/surface.ts).`,
+          );
+        }
+        typeValueForStorage = REDACTED_TYPE_VALUE;
+      }
       stmt.run(
         a.id,
         runId,
         a.kind,
         a.selector,
         a.description,
-        a.type_value,
+        typeValueForStorage,
         JSON.stringify(a.rules),
         JSON.stringify(a.meta),
       );

@@ -6,6 +6,26 @@ When delegating to `claude-code-bridge` or the QA gate, brief the implementing a
 
 ---
 
+## Shipped (out-of-sequence) — Secrets-at-rest redaction contract
+
+> Audit finding (2026-05-24): `spec.md` line 151 promises "neither the browser nor the SQLite execution row sees the literal secret," but `db.insertActions` was persisting the catalog-resolved `type_value` raw, and `oracle.ts` was interpolating it verbatim into the Haiku prompt and the heuristic prediction string. Dashboard redaction was the only layer enforcing the spec, which meant a backup of `vouch.db` or a glance at the predictions table leaked the seed/token. This slice closes the at-rest gap so the spec's claim matches the code. Spec stories served: US-13 (input catalog as the operator's secret reference). Plan components touched: db.ts persistence layer, executor.ts type-time resolution, oracle.ts prompt construction, findings.ts report rendering, cli.ts plumbing.
+
+- [x] `inputs.ts`: export `REDACTED_TYPE_VALUE` sentinel that matches the dashboard's existing redaction string so the at-rest replacement and the API output are byte-identical.
+- [x] `db.insertActions`: replace `a.type_value` with the sentinel at INSERT time when `meta.sensitive=true`. Throw with a remediation hint when `meta.sensitive=true` and `meta.catalog_entry_name` is missing so the executor would have nothing to look up later.
+- [x] `executor.resolveTypeValue` (exported helper) + `playStep` "type" case: resolve the cleartext from the in-memory `InputCatalog` by `meta.catalog_entry_name` at type-time. Four distinct named errors for the four ways the look-up can break (catalog not plumbed, entry name missing, entry not found, mid-run catalog reload).
+- [x] `ExecuteOptions.catalog`: optional `InputCatalog`. Plumbed through `executePermutations` → `executeOneCapped` → `executeOneInContext` → `playStep`.
+- [x] `cli.ts`: pass the already-loaded catalog into `runMissingPhases` (three call sites: priority phase, rest phase, resume). The resume path re-loads the catalog from `process.cwd()` so resumed runs re-validate every `*_from_env` reference and fail fast on a now-missing env var.
+- [x] `oracle.describeTypeValueForPrompt` + `describeTypeValueForSequence`: replace verbatim interpolation with a structural placeholder (catalog entry name only) for sensitive actions; values still echo for synthetic variants.
+- [x] `findings.ts`: enrich `action_sequence` with `sensitive?: boolean` and `catalog_entry_name?: string`. Renderer prints `<catalog entry 'NAME', value redacted>` for sensitive steps and never prints the sentinel string directly.
+- [x] New test file `src/core/redaction.test.ts` (15 tests). Cleartext scan asserts the SECRET string never appears in the persisted row, the resolveTypeValue surface, the Oracle render functions, or the rendered Finding.
+- [x] Existing 100 tests still pass: 115 total, all green.
+- [x] Done-criteria check: `npm run typecheck` clean, `npm test` 115/115 pass.
+- [x] `SHARING_CREDENTIALS.md` docs claim 7 ("Resolved secrets never reach disk") and claim 9 ("Resolved secrets never reach the log") are now backed by code; previously they over-promised.
+- [ ] **QA gate**: invoke `qa-adversary` via `claude-code-bridge` against the diff range `c8591ad..HEAD`. Blocked on `claude-bridge-doctor` 401 (OAuth token revoked); user re-auth required.
+- [x] Dual-push commit to GitHub + GitLab origin.
+
+---
+
 ## Shipped (out-of-sequence) — Adaptive screenshot capture + dashboard click-to-view
 
 > Operator-reported gap: the executor was writing one PNG per step at native viewport (~68 KB each, 30+ MB per run), and the dashboard never surfaced any of them — reviewing a permutation meant browsing the runs/ filesystem by hand. Closing the loop turns "what did this perm look like at step N" from a filesystem dive into a click. Spec stories served: review-loop fluency for any executed run (cross-cuts every US story that produces an Execution row). Plan components touched: Executor (screenshot capture), Findings (cleanup unchanged), Dashboard server + UI.

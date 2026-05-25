@@ -40,7 +40,23 @@ export interface Finding {
     | "visual_sketchy";
   severity: "blocking" | "warning" | "info";
   summary: string;
-  action_sequence: Array<{ id: string; kind: string; description: string; type_value: string | null }>;
+  action_sequence: Array<{
+    id: string;
+    kind: string;
+    description: string;
+    /**
+     * For sensitive (catalog-sourced) type actions, this is the redaction
+     * sentinel written by `db.insertActions` (`REDACTED_TYPE_VALUE`), not
+     * the cleartext. The cleartext never reaches this struct. The renderer
+     * checks `sensitive` and prefers a structural placeholder that names
+     * the catalog entry over showing the sentinel directly.
+     */
+    type_value: string | null;
+    /** True iff this action was produced from a `*_from_env` catalog entry. */
+    sensitive?: boolean;
+    /** Name of the catalog entry the value came from (when sensitive). */
+    catalog_entry_name?: string;
+  }>;
   expected_post_state: string;
   observed_post_state: string;
   diagnostic: string;
@@ -99,9 +115,26 @@ function findingsForPermutation(
 ): Finding[] {
   const sequence = perm.action_ids.map((id) => {
     const a = actionsById.get(id);
-    return a
-      ? { id: a.id, kind: a.kind, description: a.description, type_value: a.type_value }
-      : { id, kind: "unknown", description: `(unknown action ${id})`, type_value: null };
+    if (!a) {
+      return { id, kind: "unknown", description: `(unknown action ${id})`, type_value: null };
+    }
+    // Carry the catalog provenance forward so the renderer can show a
+    // friendly "catalog entry 'X', value redacted" line instead of either
+    // (a) leaking a secret or (b) showing the bare sentinel string.
+    // `a.type_value` is already redacted on the DB row when sensitive=true
+    // (db.insertActions writes REDACTED_TYPE_VALUE in that case).
+    const isSensitive = a.meta?.["sensitive"] === true;
+    const entryName = a.meta?.["catalog_entry_name"];
+    return {
+      id: a.id,
+      kind: a.kind,
+      description: a.description,
+      type_value: a.type_value,
+      ...(isSensitive ? { sensitive: true } : {}),
+      ...(typeof entryName === "string" && entryName.length > 0
+        ? { catalog_entry_name: entryName }
+        : {}),
+    };
   });
   const short = shortIdOf(perm.id);
   const out: Finding[] = [];
@@ -292,7 +325,19 @@ export function renderFindingsMarkdown(report: FindingsReport): string {
       lines.push("");
       for (let i = 0; i < f.action_sequence.length; i++) {
         const a = f.action_sequence[i]!;
-        const val = a.type_value !== null ? ` (types: "${a.type_value}")` : "";
+        // Sensitive actions: show the catalog entry name, NEVER the value.
+        // The value on the row is already the redaction sentinel, but the
+        // entry name is more useful to a human auditor than the literal
+        // sentinel string would be.
+        let val: string;
+        if (a.sensitive === true) {
+          const name = a.catalog_entry_name ?? "(unknown)";
+          val = ` (types: <catalog entry '${name}', value redacted>)`;
+        } else if (a.type_value !== null) {
+          val = ` (types: "${a.type_value}")`;
+        } else {
+          val = "";
+        }
         lines.push(`${i + 1}. \`${a.kind}\` — ${a.description}${val}`);
       }
       lines.push("");

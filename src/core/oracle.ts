@@ -895,7 +895,11 @@ function predictHeuristic(input: OracleInputs): OracleResult {
       case "focus_input":
         return `Step ${num}: the user focuses ${a.description.replace(/^Focus /, "")}; expect a visible caret in the field and no other change.`;
       case "type":
-        return `Step ${num}: the user types "${a.type_value ?? ""}" into ${a.description.replace(/^Type into /, "")}; expect the field's value to update and (on forms with live validation) a validation message if the value violates the field type.`;
+        // Catalog-sourced sensitive values are not interpolated verbatim into
+        // the heuristic prediction. The heuristic output is persisted to the
+        // predictions table and surfaced on the dashboard; leaking the
+        // resolved seed/token there defeats the *_from_env indirection.
+        return `Step ${num}: the user types ${describeTypeValueForPrompt(a)} into ${a.description.replace(/^Type into /, "")}; expect the field's value to update and (on forms with live validation) a validation message if the value violates the field type.`;
       case "toggle_checkbox":
         return `Step ${num}: the user toggles ${a.description.replace(/^Toggle /, "")}; expect the checkbox's checked state to flip and any dependent UI to react.`;
       case "select_option":
@@ -921,10 +925,56 @@ function describeSequence(input: OracleInputs): string {
       continue;
     }
     const sel = a.selector ? ` [selector: ${a.selector}]` : "";
-    const val = a.type_value ? ` [types: "${a.type_value}"]` : "";
+    // describeTypeValueForPrompt redacts sensitive values; non-sensitive
+    // values are echoed verbatim. This string ends up in the prompt sent to
+    // the Anthropic Haiku API (anthropic-haiku source) and in the heuristic
+    // prediction stored in the predictions table, so this is the redaction
+    // boundary for the Oracle module.
+    const val = describeTypeValueForSequence(a);
     lines.push(`${i + 1}. ${a.description}${sel}${val}`);
   }
   return lines.join("\n");
+}
+
+/**
+ * Render a `type` action's value for the Oracle's PROSE prediction string.
+ *
+ * For non-sensitive actions, returns the value in quotes verbatim (e.g.
+ * `"vouch+probe@example.com"`).
+ *
+ * For sensitive actions, returns a structural placeholder that names the
+ * catalog entry but not its resolved value (e.g. `the operator-supplied
+ * value from catalog entry 'solana_devnet_funded'`). This keeps the Oracle's
+ * prediction expressive about WHAT happens without leaking the secret.
+ *
+ * Exported for unit tests.
+ */
+export function describeTypeValueForPrompt(action: Action): string {
+  if (action.meta?.["sensitive"] === true) {
+    const entryName = action.meta["catalog_entry_name"];
+    const name = typeof entryName === "string" && entryName.length > 0 ? entryName : "(unknown)";
+    return `the operator-supplied value from catalog entry '${name}'`;
+  }
+  return `"${action.type_value ?? ""}"`;
+}
+
+/**
+ * Render a `type` action's value as a bracketed annotation for the Oracle's
+ * `describeSequence` enumeration (the action-by-action list embedded in the
+ * Anthropic prompt).
+ *
+ * Mirrors the redaction rules in `describeTypeValueForPrompt` but returns
+ * the bracketed form expected by the surrounding template.
+ *
+ * Exported for unit tests.
+ */
+export function describeTypeValueForSequence(action: Action): string {
+  if (action.meta?.["sensitive"] === true) {
+    const entryName = action.meta["catalog_entry_name"];
+    const name = typeof entryName === "string" && entryName.length > 0 ? entryName : "(unknown)";
+    return ` [types: <catalog entry '${name}', value redacted>]`;
+  }
+  return action.type_value ? ` [types: "${action.type_value}"]` : "";
 }
 
 /** Build a Prediction row from an OracleResult. */

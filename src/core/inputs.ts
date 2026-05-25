@@ -42,6 +42,21 @@ import { z } from "zod";
 
 const CATALOG_FILENAME = "vouch.inputs.yaml";
 
+/**
+ * Sentinel written into `Action.type_value` at INSERT time when an action is
+ * `meta.sensitive=true` (came from a `*_from_env` catalog entry). The raw
+ * resolved value is never persisted; the executor re-resolves the real value
+ * from the in-memory catalog at type-time via `meta.catalog_entry_name`.
+ *
+ * The string exactly matches what `dashboard/server.ts` already surfaces to
+ * the dashboard UI, so post-fix the DB row and the dashboard show the same
+ * thing without divergence.
+ *
+ * If you change this string, also update `dashboard/server.ts` and the
+ * tests in `redaction.test.ts`.
+ */
+export const REDACTED_TYPE_VALUE = "[redacted: catalog-sourced sensitive value]";
+
 /** A regex over an entry's `name:` to catch obviously-secret keys in the file. */
 const FORBIDDEN_KEY_PATTERNS = [
   /^seed$/i,

@@ -435,6 +435,7 @@ async function runOneDepth(input: RunOneDepthInputs): Promise<string> {
       verifySource,
       screenshots: input.screenshots,
       logPrefix: `[depth ${depth} retest]`,
+      catalog,
     });
 
     const priorityIds = new Set(priorityPerms.map((p) => p.id));
@@ -484,6 +485,7 @@ async function runOneDepth(input: RunOneDepthInputs): Promise<string> {
       verifySource,
       screenshots: input.screenshots,
       logPrefix: `[depth ${depth}]`,
+      catalog,
     });
   }
 
@@ -555,6 +557,14 @@ interface RunMissingPhasesInputs {
   verifySource: PredictionSource;
   screenshots: boolean;
   logPrefix: string;
+  /**
+   * In-memory input catalog. Passed straight through to executePermutations
+   * so sensitive `type` actions can resolve their cleartext at type-time
+   * from the catalog rather than from the persisted (and redacted) row.
+   * Always required, even when empty — an empty catalog is fine when no
+   * action in the run is `meta.sensitive=true`.
+   */
+  catalog: ReturnType<typeof loadCatalog>;
 }
 
 async function runMissingPhases(input: RunMissingPhasesInputs): Promise<void> {
@@ -571,6 +581,7 @@ async function runMissingPhases(input: RunMissingPhasesInputs): Promise<void> {
     verify,
     verifySource,
     logPrefix,
+    catalog,
   } = input;
   void actions; // currently unused here; kept on the interface for future phase additions
 
@@ -681,6 +692,12 @@ async function runMissingPhases(input: RunMissingPhasesInputs): Promise<void> {
     const execs = await executePermutations(executorPending, actionsById, {
       targetUrl,
       screenshotsDir,
+      // Pass the in-memory catalog so the executor can resolve sensitive
+      // `type` actions at type-time. The catalog-sourced cleartext is NOT
+      // on the persisted Action row (db.ts redacts at INSERT); without
+      // this, sensitive perms would either type the redaction sentinel
+      // into the SUT or throw a defensive error.
+      catalog,
       ...(envPermTimeout !== undefined ? { permTimeoutMs: envPermTimeout } : {}),
       ...(envLaunchTimeout !== undefined ? { launchTimeoutMs: envLaunchTimeout } : {}),
     });
@@ -1263,6 +1280,13 @@ program
       );
 
       const actionsById = new Map(actions.map((a) => [a.id, a]));
+      // Re-load the catalog from the project root so resumed runs can resolve
+      // sensitive type actions at type-time. The catalog is not persisted
+      // (its values would be the redaction sentinel anyway), and re-loading
+      // re-validates the env vars referenced by *_from_env, so the resume
+      // fails fast if a required env var has been unset since the original
+      // run started.
+      const catalog = loadCatalog(process.cwd());
       await runMissingPhases({
         db,
         project,
@@ -1277,6 +1301,7 @@ program
         verifySource,
         screenshots: opts.screenshots !== false,
         logPrefix: `[resume ${run.id.split("_").pop()}]`,
+        catalog,
       });
       // runMissingPhases used to finalize + cleanup itself; that responsibility
       // moved to the orchestrator when broken-first scheduling landed (so

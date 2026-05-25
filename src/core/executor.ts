@@ -22,6 +22,7 @@ import { dirname, resolve, join } from "node:path";
 
 import { chromium, type Browser, type BrowserContext } from "playwright";
 
+import { type InputCatalog } from "./inputs.js";
 import { waitForInteractableContent } from "./page-utils.js";
 import {
   type Action,
@@ -97,6 +98,23 @@ export interface ExecuteOptions {
    * together. Default OFF when this option is absent; the CLI defaults it ON.
    */
   screenshotsDir?: string | null;
+  /**
+   * In-memory input catalog used to resolve sensitive `type` actions at
+   * type-time. Required only when any action being executed has
+   * `meta.sensitive=true`; for non-sensitive runs the field can be omitted.
+   *
+   * Why this is plumbed in: `db.insertActions` redacts the resolved value
+   * from `Action.type_value` at write time (the catalog-sourced secret must
+   * not reach disk). The executor therefore cannot read the value from the
+   * Action row at type-time; it must resolve from the in-memory catalog by
+   * `meta.catalog_entry_name` instead. Holding the catalog in memory only
+   * is the entire point of the `*_from_env` indirection.
+   *
+   * If a sensitive action is encountered and the catalog is unset or the
+   * referenced entry is missing, the type step fails fast with a clear
+   * error rather than silently typing the redaction sentinel into the SUT.
+   */
+  catalog?: InputCatalog;
 }
 
 /**
@@ -134,6 +152,7 @@ export async function executePermutations(
   const launchTimeout = opts.launchTimeoutMs ?? DEFAULT_LAUNCH_TIMEOUT_MS;
   const permTimeout = opts.permTimeoutMs ?? DEFAULT_PERM_TIMEOUT_MS;
   const screenshotsDir = opts.screenshotsDir ?? null;
+  const catalog = opts.catalog;
   const out: Execution[] = [];
 
   let browser: Browser | null = null;
@@ -150,6 +169,7 @@ export async function executePermutations(
           navTimeout,
           screenshotsDir,
           permTimeout,
+          catalog,
         ),
       );
     }
@@ -257,6 +277,7 @@ async function executeOneCapped(
   navTimeout: number,
   screenshotsDir: string | null,
   permTimeoutMs: number,
+  catalog: InputCatalog | undefined,
 ): Promise<Execution> {
   const startedAt = new Date().toISOString();
   let ctx: BrowserContext;
@@ -305,6 +326,7 @@ async function executeOneCapped(
     startedAt,
     sharedStepLog,
     sharedAnomalies,
+    catalog,
   );
   // Suppress an unhandled-rejection log if work loses the race to the cap.
   // The timeout path resolves with a synthetic Execution; the work promise
@@ -377,6 +399,13 @@ async function executeOneInContext(
    * rationale as stepLog: the cap path snapshots this on timeout.
    */
   anomalies: Anomaly[],
+  /**
+   * In-memory catalog forwarded from `ExecuteOptions`. Required when any
+   * action in this perm is `meta.sensitive=true`; the executor resolves
+   * the catalog-sourced value at type-time and types that, instead of the
+   * redaction sentinel that lives on the persisted row.
+   */
+  catalog: InputCatalog | undefined,
 ): Promise<Execution> {
   let verdict: Verdict = "pass";
   let errorClass: string | null = null;
@@ -479,7 +508,7 @@ async function executeOneInContext(
     let stepOk = true;
     let stepErr: string | null = null;
     try {
-      await playStep(page, action, activeFocus, stepTimeout, anomalies);
+      await playStep(page, action, activeFocus, stepTimeout, anomalies, catalog);
       if (action.kind === "focus_input") {
         activeFocus = { selector: action.selector ?? "" };
       } else {
@@ -640,6 +669,14 @@ async function playStep(
    * future cases (e.g., a select_option that triggers a fetch) can opt in.
    */
   anomalies: Anomaly[],
+  /**
+   * In-memory catalog used to resolve sensitive `type` actions at type-time.
+   * Required when `action.meta.sensitive === true`; otherwise unused. The
+   * raw secret never reaches the persisted Action row (db.ts redacts at
+   * INSERT), so the only way to recover the value for the keyboard.type
+   * call is to look it up here from the catalog held by the run process.
+   */
+  catalog: InputCatalog | undefined,
 ): Promise<void> {
   switch (action.kind) {
     case "click": {
@@ -736,7 +773,21 @@ async function playStep(
             `This permutation should have been filtered by permutations.ts; if you see this error, the rule filter is broken.`,
         );
       }
-      await page.keyboard.type(action.type_value ?? "", { delay: 5 });
+      // Sensitive type actions: the persisted Action row carries the redaction
+      // sentinel, NOT the secret. Resolve the real value from the in-memory
+      // catalog by `meta.catalog_entry_name`. The catalog is process-scoped
+      // (loaded by cli.ts from vouch.inputs.yaml + env vars) and never reaches
+      // disk. This is the only place in the runtime that needs the cleartext.
+      //
+      // Fail-fast cases (each gets a specific, actionable error):
+      //   - catalog wasn't plumbed through ExecuteOptions
+      //   - meta.catalog_entry_name is missing
+      //   - catalog has no text entry by that name
+      // Any of these would cause Playwright to type the redaction sentinel
+      // into the SUT, which would fail server-side validation in a way that
+      // looks like a "real" finding but is actually our bug. Better to abort.
+      const valueToType = resolveTypeValue(action, catalog);
+      await page.keyboard.type(valueToType, { delay: 5 });
       return;
     }
     case "toggle_checkbox": {
@@ -1032,6 +1083,68 @@ async function captureHiResScreenshot(
     // Best-effort.
     return null;
   }
+}
+
+/**
+ * Resolve the value that Playwright should type for a `type` action.
+ *
+ * Non-sensitive actions: the cleartext is on the Action row (synthetic
+ * variants from `surface.ts.plausibleValuesFor`). Return `action.type_value`
+ * (or empty string if null, matching the prior behavior).
+ *
+ * Sensitive actions: `db.insertActions` replaced the row's `type_value` with
+ * the `REDACTED_TYPE_VALUE` sentinel at INSERT time so the secret never
+ * reached SQLite. Resolve the real value from the in-memory `catalog` by
+ * `meta.catalog_entry_name`.
+ *
+ * Each failure mode raises a specific, actionable error. They are split
+ * out so an operator who hits one knows EXACTLY which contract broke:
+ *
+ *   - `catalog` not plumbed: someone called the executor without
+ *     `ExecuteOptions.catalog` for a run that contains sensitive actions.
+ *     Fix is in the caller (cli.ts), not the SUT.
+ *
+ *   - `meta.catalog_entry_name` missing: the surface mapper produced a
+ *     sensitive action without attaching its provenance. Fix is in
+ *     `surface.ts.realVariantFor`.
+ *
+ *   - catalog entry not found: the YAML had an entry at action-creation
+ *     time but doesn't now, OR the entry name on the action disagrees with
+ *     the catalog. Indicates the catalog was reloaded mid-run, or a stale
+ *     run is being re-executed against a different YAML.
+ *
+ * Exported for unit tests.
+ */
+export function resolveTypeValue(action: Action, catalog: InputCatalog | undefined): string {
+  const isSensitive = action.meta?.["sensitive"] === true;
+  if (!isSensitive) {
+    return action.type_value ?? "";
+  }
+  if (!catalog) {
+    throw new Error(
+      `type action '${action.id}' has meta.sensitive=true but the executor was invoked ` +
+        `without ExecuteOptions.catalog. The redacted-on-disk secret cannot be resolved. ` +
+        `Fix: pass the InputCatalog loaded by cli.ts into executePermutations.`,
+    );
+  }
+  const entryName = action.meta?.["catalog_entry_name"];
+  if (typeof entryName !== "string" || entryName.length === 0) {
+    throw new Error(
+      `type action '${action.id}' is sensitive but has no meta.catalog_entry_name. ` +
+        `The executor has nothing to look up in the catalog. ` +
+        `Fix surface.ts so realVariantFor attaches catalog_entry_name alongside sensitive.`,
+    );
+  }
+  const entry = catalog.text.find((e) => e.name === entryName);
+  if (!entry) {
+    throw new Error(
+      `type action '${action.id}' references catalog entry '${entryName}' but no such ` +
+        `text entry exists in the in-memory catalog. ` +
+        `Either the catalog was reloaded between enumeration and execution, or this is a ` +
+        `stale run being re-executed against a different vouch.inputs.yaml.`,
+    );
+  }
+  return entry.value;
 }
 
 async function observePostState(page: import("playwright").Page): Promise<string> {

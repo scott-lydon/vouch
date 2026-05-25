@@ -22,6 +22,7 @@ import { chromium, type Browser, type Page } from "playwright";
 import {
   matchFileEntry,
   matchTextEntry,
+  REDACTED_TYPE_VALUE,
   type InputCatalog,
   type FieldSurface,
 } from "./inputs.js";
@@ -592,4 +593,32 @@ function synthesizeActions(rawNodes: RawNode[], catalog?: InputCatalog): Action[
   });
 
   return out;
+}
+
+/**
+ * Return a copy of `actions` where every `meta.sensitive === true` action has
+ * its `type_value` replaced by `REDACTED_TYPE_VALUE` (the same sentinel the
+ * persistence layer writes at INSERT time and the dashboard surfaces to the
+ * UI). The catalog entry name in `meta.catalog_entry_name` is preserved so a
+ * human auditor still sees which entry the action targets.
+ *
+ * Use this on ANY code path that serializes the in-memory `Action[]` returned
+ * by `mapSurface()` to stdout, disk, or the network. The persistence layer
+ * (db.insertActions) already redacts before SQLite write, but transient
+ * surfaces — `vouch map` stdout, dashboards reading the in-memory list before
+ * insert, hypothetical future `--dry-run` modes — must call this first.
+ *
+ * Why this exists as a standalone function instead of being baked into
+ * `mapSurface`: the executor needs the cleartext `Action.type_value` to
+ * actually type the secret into the SUT (the value is read from the catalog
+ * at type-time via `executor.resolveTypeValue`, not from the action, but
+ * historic call sites still expect it). Redacting at the surface boundary
+ * would break those callers. Redaction is the responsibility of the
+ * serialization boundary, not the producer.
+ */
+export function redactSensitiveActionsForDisplay(actions: Action[]): Action[] {
+  return actions.map((a) => {
+    if (a.meta?.["sensitive"] !== true) return a;
+    return { ...a, type_value: REDACTED_TYPE_VALUE };
+  });
 }

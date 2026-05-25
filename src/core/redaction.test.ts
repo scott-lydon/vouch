@@ -46,7 +46,8 @@ import {
 } from "./oracle.js";
 import { REDACTED_TYPE_VALUE, type InputCatalog } from "./inputs.js";
 import { type Action } from "./types.js";
-import { analyzeRun } from "./findings.js";
+import { analyzeRun, renderFindingsMarkdown } from "./findings.js";
+import { redactSensitiveActionsForDisplay } from "./surface.js";
 import { upsertExecution } from "./db.js";
 import { insertPermutations } from "./db.js";
 
@@ -365,5 +366,127 @@ describe("findings: rendered report never contains sensitive cleartext", () => {
     } finally {
       cleanupTmpDB(dir);
     }
+  });
+
+  // Regression test for the markdown renderer specifically. The describe block
+  // above tests the JSON payload; this one pins the markdown contract so a
+  // future debug-print in `renderFindingsMarkdown` cannot reintroduce the leak
+  // without a failing test.
+  it("renderFindingsMarkdown never emits sensitive cleartext or the raw sentinel string", () => {
+    const { db, dir } = openTmpDB();
+    try {
+      insertProject(db, {
+        id: "proj_test_md",
+        name: "test_md",
+        description: "",
+        spec_text: "",
+        created_at: new Date().toISOString(),
+      });
+      insertRun(db, {
+        id: "run_test_md",
+        project_id: "proj_test_md",
+        target_url: "http://localhost",
+        spec_text: "",
+        spec_sha256: "",
+        strategy: "exhaustive",
+        depth: 1,
+        started_at: new Date().toISOString(),
+        finished_at: null,
+        prediction_source: "heuristic",
+      });
+      insertActions(db, "run_test_md", [makeSensitiveTypeAction()]);
+      insertPermutations(db, [
+        {
+          id: "perm_test_md",
+          run_id: "run_test_md",
+          action_ids: ["type__email__sensitive"],
+          index: 0,
+        },
+      ]);
+      upsertExecution(db, {
+        permutation_id: "perm_test_md",
+        verdict: "fail",
+        step_log: [],
+        anomalies: [],
+        observed_post_state: "boom",
+        started_at: new Date().toISOString(),
+        finished_at: new Date().toISOString(),
+        error_class: "test_failure",
+        final_state_screenshot_path: null,
+      });
+
+      const report = analyzeRun(db, "run_test_md");
+      const md = renderFindingsMarkdown(report);
+
+      // The cleartext must never appear in the rendered markdown.
+      expect(md).not.toContain(SECRET);
+      // The raw sentinel must also not appear — the renderer's sensitive
+      // branch substitutes a structural placeholder that is more useful to a
+      // human auditor than the bare sentinel string.
+      expect(md).not.toContain(REDACTED_TYPE_VALUE);
+      // The structural placeholder IS present.
+      expect(md).toContain("operator_email");
+      expect(md).toContain("value redacted");
+    } finally {
+      cleanupTmpDB(dir);
+    }
+  });
+});
+
+describe("surface.redactSensitiveActionsForDisplay: vouch map stdout contract", () => {
+  // Why these tests exist: the `vouch map` command's earlier implementation
+  // dumped `Action[]` to stdout via `JSON.stringify` directly. For catalog
+  // entries marked `sensitive: true` (i.e. `*_from_env` rows), `type_value`
+  // on the in-memory action carries the cleartext because the executor needs
+  // it at type-time. Without the redaction-at-display helper, the cleartext
+  // hit terminal scrollback and shell history every time an operator ran
+  // `vouch map --target ...` against a real catalog. These tests pin the
+  // contract that the helper redacts sensitive `type_value` to the sentinel
+  // while preserving the catalog entry name for human auditors.
+  it("replaces type_value with the sentinel for sensitive actions and preserves catalog_entry_name", () => {
+    const sensitive = makeSensitiveTypeAction();
+    const [redacted] = redactSensitiveActionsForDisplay([sensitive]);
+    if (!redacted) throw new Error("expected one redacted action");
+    expect(redacted.type_value).toBe(REDACTED_TYPE_VALUE);
+    expect(redacted.meta?.["catalog_entry_name"]).toBe("operator_email");
+    expect(redacted.meta?.["sensitive"]).toBe(true);
+  });
+
+  it("leaves non-sensitive actions untouched (synthetic values pass through)", () => {
+    const synthetic = makeSyntheticTypeAction();
+    const [unchanged] = redactSensitiveActionsForDisplay([synthetic]);
+    if (!unchanged) throw new Error("expected one passthrough action");
+    expect(unchanged).toBe(synthetic); // referential equality — no clone for non-sensitive
+    expect(unchanged.type_value).toBe("vouch+probe@example.com");
+  });
+
+  it("JSON.stringify of redacted actions does NOT contain the cleartext", () => {
+    // This is the literal `vouch map` stdout call path: redact, then
+    // JSON.stringify, then write. The cleartext must not survive that pipeline.
+    const sensitive = makeSensitiveTypeAction();
+    const synthetic = makeSyntheticTypeAction();
+    const redacted = redactSensitiveActionsForDisplay([sensitive, synthetic]);
+    const serialized = JSON.stringify(redacted, null, 2);
+    expect(serialized).not.toContain(SECRET);
+    expect(serialized).toContain(REDACTED_TYPE_VALUE);
+    // The non-sensitive action's value still shows up.
+    expect(serialized).toContain("vouch+probe@example.com");
+  });
+
+  it("documents the BUG (pre-fix behavior): JSON.stringify of raw actions DOES contain cleartext", () => {
+    // This is the regression we just fixed in `vouch map`. The unredacted
+    // action's `type_value` is the cleartext; if any future caller serializes
+    // a sensitive Action without going through `redactSensitiveActionsForDisplay`
+    // first, they hit this leak. Keeping the test asserts the producer-side
+    // invariant (cleartext IS present on the in-memory action) so a reader
+    // understands why the redaction helper is mandatory at every serialization
+    // boundary.
+    const sensitive = makeSensitiveTypeAction();
+    const serialized = JSON.stringify([sensitive], null, 2);
+    expect(serialized).toContain(SECRET); // unredacted = leak
+  });
+
+  it("handles an empty array", () => {
+    expect(redactSensitiveActionsForDisplay([])).toEqual([]);
   });
 });

@@ -48,7 +48,7 @@ import {
   lowerHappyPathToRows,
 } from "./core/happy_paths.js";
 import { INPUTS_TEMPLATE, loadCatalog } from "./core/inputs.js";
-import { mapSurface } from "./core/surface.js";
+import { mapSurface, redactSensitiveActionsForDisplay } from "./core/surface.js";
 import {
   finalizeRun,
   getExecution,
@@ -1378,9 +1378,21 @@ program
   .action(async (opts: { target: string }) => {
     // Standalone `vouch map` also honors the input catalog so the action
     // list it prints matches what a real `vouch run` would execute.
+    //
+    // Redaction: catalog-sourced sensitive entries (`*_from_env`) leave
+    // `mapSurface` with their cleartext on `Action.type_value` because the
+    // executor still needs the live value to type into the SUT. The persistence
+    // layer (db.insertActions) redacts at INSERT time, but `vouch map` never
+    // writes to SQLite — it just dumps JSON to stdout. Without the explicit
+    // redaction below, a developer running `vouch map --target ...` against a
+    // catalog with a `seed_phrase_from_env` entry would see the cleartext in
+    // their terminal scrollback and shell history. We redact here so the
+    // contract documented in SHARING_CREDENTIALS.md (resolved secrets never
+    // reach disk or stdout) also covers this command.
     const catalog = loadCatalog(process.cwd());
     const actions = await mapSurface(opts.target, {}, catalog);
-    process.stdout.write(JSON.stringify(actions, null, 2) + "\n");
+    const safe = redactSensitiveActionsForDisplay(actions);
+    process.stdout.write(JSON.stringify(safe, null, 2) + "\n");
   });
 
 program.parseAsync(process.argv).catch((err: Error) => {

@@ -30,6 +30,7 @@ import {
   updatePredictionNote,
 } from "../core/db.js";
 import { analyzeRun, renderFindingsMarkdown } from "../core/findings.js";
+import { REDACTED_TYPE_VALUE } from "../core/inputs.js";
 import { summarizeRun, type RunSummary } from "../core/run-summary.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -207,7 +208,12 @@ export async function startServer(dbPath: string, port: number): Promise<void> {
             kind: a.kind,
             description: a.description,
             selector: a.selector,
-            type_value: sensitive ? "[redacted: catalog-sourced sensitive value]" : a.type_value,
+            // Use the shared constant so a rename in inputs.ts cannot silently
+            // desync the dashboard's redaction string from the DB row sentinel.
+            // Pre-this-commit: hardcoded literal; a rename of REDACTED_TYPE_VALUE
+            // would compile and tests would pass but the dashboard would emit
+            // a different string than the row contained.
+            type_value: sensitive ? REDACTED_TYPE_VALUE : a.type_value,
             catalog_entry_name: catalogEntryName,
             catalog_fixture_kind: fixtureKind === "catalog" ? "catalog" : undefined,
             sensitive,

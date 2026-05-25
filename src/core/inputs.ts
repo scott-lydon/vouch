@@ -48,12 +48,13 @@ const CATALOG_FILENAME = "vouch.inputs.yaml";
  * resolved value is never persisted; the executor re-resolves the real value
  * from the in-memory catalog at type-time via `meta.catalog_entry_name`.
  *
- * The string exactly matches what `dashboard/server.ts` already surfaces to
- * the dashboard UI, so post-fix the DB row and the dashboard show the same
- * thing without divergence.
+ * The DB row, the dashboard UI (`dashboard/server.ts` imports this constant),
+ * and the `vouch map` stdout (via `surface.redactSensitiveActionsForDisplay`)
+ * all share this single source of truth, so a rename here propagates atomically
+ * to every redaction site.
  *
- * If you change this string, also update `dashboard/server.ts` and the
- * tests in `redaction.test.ts`.
+ * The redaction-contract tests in `redaction.test.ts` import this constant
+ * too, so changing the literal will not require touching test fixtures.
  */
 export const REDACTED_TYPE_VALUE = "[redacted: catalog-sourced sensitive value]";
 

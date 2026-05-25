@@ -188,3 +188,107 @@ details.step-row[open] > summary > span.text-xs { opacity: 0 !important; }
   height: 8px;
   border-radius: 999px;
 }
+
+/* Compact run row used on the project page. The whole element is an <a>
+ * panel; padding is tighter than .panel.p-5 because we deliberately want
+ * 7+ runs visible at once on a normal laptop without scrolling. Hover
+ * surfaces the click affordance the long card used to imply with size. */
+.run-row {
+  display: block;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 14px;
+  transition: border-color 0.15s ease, transform 0.05s ease;
+}
+.run-row:hover {
+  border-color: var(--accent2);
+  text-decoration: none;
+}
+.run-row:active { transform: translateY(1px); }
+
+.run-row-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.run-row-time {
+  white-space: nowrap;
+}
+.run-row-rel {
+  opacity: 0.75;
+  margin-left: 2px;
+}
+
+/* Row 2: bar + chips on one line. The bar grows to fill, chips sit on the
+ * right at intrinsic width. On narrow viewports (< ~520px) the chips wrap
+ * underneath so they remain readable. */
+.run-row-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 8px;
+}
+.run-row-bar .run-breakdown-bar {
+  flex: 1 1 auto;
+  height: 6px;
+}
+.run-row-bar-empty {
+  margin-top: 6px;
+  font-style: italic;
+}
+
+.run-row-chips {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+  font-size: 0.78rem;
+}
+.run-row-total {
+  font-weight: 600;
+  opacity: 0.85;
+}
+.run-row-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-weight: 600;
+  color: var(--text);
+}
+.run-row-chip-count { line-height: 1; }
+
+/* Row 3: muted footer with URL on the left and identifiers on the right.
+ * URL truncates with an ellipsis so a 100-character target doesn't push
+ * the row's height up. The identifiers stay single-line (no wrap). */
+.run-row-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 6px;
+  font-size: 0.72rem;
+  color: var(--muted);
+  min-width: 0;
+}
+.run-row-url {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: "JetBrains Mono", Menlo, Monaco, Consolas, monospace;
+  font-size: 0.72rem;
+}
+.run-row-meta {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.run-row-meta code {
+  background: transparent;
+  padding: 0;
+  font-size: 0.72rem;
+  color: var(--text);
+}

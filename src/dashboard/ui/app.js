@@ -171,22 +171,15 @@ async function viewProject(projectId) {
       project.description ? el('p', { class: 'muted mb-6' }, project.description) : null,
       specPanel(project.spec_text),
       el('h2', { class: 'text-2xl font-semibold mb-4' }, `${runs.length} run${runs.length === 1 ? '' : 's'}`),
-      el('div', { class: 'space-y-3' },
-        runs.map((r) =>
-          el('a', { href: `#/run/${r.id}`, class: 'panel p-5 block', style: 'text-decoration:none;color:inherit;' }, [
-            el('div', { class: 'flex flex-wrap items-center gap-3' }, [
-              el('span', { class: 'badge badge-accent' }, `depth ${r.depth}`),
-              el('span', { class: 'badge ' + ((r.prediction_source === 'heuristic' ? 'badge-warn' : 'badge-good')) }, r.prediction_source),
-              el('span', { class: r.finished_at ? 'badge badge-good' : 'badge badge-warn' }, r.finished_at ? 'finished' : 'in-progress'),
-            ]),
-            el('div', { class: 'mt-2 text-sm' }, [
-              el('strong', {}, fmtLocal(r.started_at)),
-              el('span', { class: 'muted' }, ` · ${r.target_url}`),
-            ]),
-            runBreakdown(r.summary),
-            el('div', { class: 'muted text-xs mt-2' }, `id: ${r.id} · spec sha=${r.spec_sha256}`),
-          ])
-        )
+      // Compact one-row-per-run layout. Three lines per card:
+      //   1. badges + date+relative on a single line
+      //   2. thin progress bar with inline tier chips on the right
+      //   3. muted footer: target url · short id · short sha
+      // Replaces the earlier four-row card that wasted ~170px per run; this
+      // one comes in around 80–90px so the operator can see 7 runs without
+      // scrolling on a normal laptop screen.
+      el('div', { class: 'space-y-2' },
+        runs.map((r) => renderRunRow(r))
       )
     ])
   );
@@ -334,6 +327,130 @@ function statCard(label, value, badgeClass) {
   return el('div', { class: 'panel p-4 text-center' }, [
     el('div', { class: 'text-2xl font-bold accent-text' }, String(value)),
     el('div', { class: 'text-xs muted mt-1' }, label),
+  ]);
+}
+
+/**
+ * Render one row in the runs list as a compact 3-line panel:
+ *   Row 1 — badges (depth, source, status) + start time + relative timestamp
+ *   Row 2 — the four-tier progress bar with chips inline on the right
+ *   Row 3 — muted footer: target url, short run id, short spec sha
+ *
+ * The "long card" version was readable but cost ~170px per run; this
+ * compact form lands around 80–90px and keeps the same information
+ * density per row. Clicking anywhere on the row navigates into the run
+ * detail page (the whole panel is an <a>).
+ */
+function renderRunRow(r) {
+  const finished = !!r.finished_at;
+  const shortId = r.id.length > 28 ? r.id.slice(0, 28) + '…' : r.id;
+  const shortSha = r.spec_sha256 ? r.spec_sha256.slice(0, 7) : '—';
+  const breakdown = runBreakdownInline(r.summary);
+  return el(
+    'a',
+    {
+      href: `#/run/${r.id}`,
+      class: 'run-row block',
+      style: 'text-decoration:none;color:inherit;',
+    },
+    [
+      // Row 1: badges left, date right.
+      el('div', { class: 'run-row-head' }, [
+        el('div', { class: 'flex items-center gap-2 flex-wrap' }, [
+          el('span', { class: 'badge badge-accent' }, `depth ${r.depth}`),
+          el(
+            'span',
+            { class: 'badge ' + (r.prediction_source === 'heuristic' ? 'badge-warn' : 'badge-good') },
+            r.prediction_source,
+          ),
+          el(
+            'span',
+            { class: 'badge ' + (finished ? 'badge-good' : 'badge-warn') },
+            finished ? 'finished' : 'in-progress',
+          ),
+        ]),
+        el('div', { class: 'run-row-time text-xs muted' }, [
+          el('span', {}, fmtLocal(r.started_at)),
+          el('span', { class: 'run-row-rel' }, ` · ${fmtRelative(r.started_at)}`),
+        ]),
+      ]),
+      // Row 2: bar + inline chips. runBreakdownInline returns null when there
+      // are no permutations yet so the row collapses cleanly.
+      breakdown,
+      // Row 3: target url + identifiers, muted and tiny. Truncates the URL
+      // with CSS so long targets don't force the card to grow.
+      el('div', { class: 'run-row-foot' }, [
+        el('span', { class: 'run-row-url', title: r.target_url }, r.target_url),
+        el('span', { class: 'run-row-meta' }, [
+          el('span', { class: 'muted' }, 'id '),
+          el('code', { title: r.id }, shortId),
+          el('span', { class: 'muted' }, ' · sha '),
+          el('code', { title: r.spec_sha256 || '' }, shortSha),
+        ]),
+      ]),
+    ],
+  );
+}
+
+/**
+ * Compact inline variant of {@link runBreakdown} used by the runs list.
+ * Same four-tier model (verified / with_concerns / issues / not_executed),
+ * but the bar and the chips share a single row: bar on the left with
+ * flex-grow, chips packed on the right. Tooltips on each segment AND each
+ * chip carry the full "label: count / total (pct%)" string so hover gives
+ * the operator the unabridged number without inflating the row height.
+ *
+ * Returns null when summary is missing or the run has zero permutations so
+ * the row collapses to header + footer with no awkward blank bar.
+ */
+function runBreakdownInline(summary) {
+  if (!summary) return null;
+  const total = summary.permutations;
+  if (total === 0) {
+    return el('div', { class: 'muted text-xs run-row-bar-empty' },
+      'No permutations were generated for this run.');
+  }
+  const tiers = [
+    { key: 'verified',      label: 'verified',      cssVar: 'var(--good)' },
+    { key: 'with_concerns', label: 'with concerns', cssVar: 'var(--warn)' },
+    { key: 'issues',        label: 'issues',        cssVar: 'var(--bad)' },
+    { key: 'not_executed',  label: 'not executed',  cssVar: 'var(--muted)' },
+  ];
+  const segments = tiers
+    .filter((t) => (summary.counts[t.key] ?? 0) > 0)
+    .map((t) => el('span', {
+      class: 'run-breakdown-seg',
+      style: `flex-grow: ${summary.counts[t.key]}; background: ${t.cssVar};`,
+      title: `${t.label}: ${summary.counts[t.key]} / ${total} (${summary.percentages[t.key]}%)`,
+    }));
+  // Chips are dot + count only; the percentage and label live in the title
+  // tooltip. Keeps the row to a single line on a typical laptop width.
+  const chips = tiers
+    .filter((t) => (summary.counts[t.key] ?? 0) > 0)
+    .map((t) => el(
+      'span',
+      {
+        class: 'run-row-chip',
+        title: `${summary.counts[t.key]} ${t.label} (${summary.percentages[t.key]}%)`,
+      },
+      [
+        el('span', { class: 'run-breakdown-dot', style: `background: ${t.cssVar};` }),
+        el('span', { class: 'run-row-chip-count' }, String(summary.counts[t.key])),
+      ],
+    ));
+  return el('div', { class: 'run-row-bar' }, [
+    el('div', {
+      class: 'run-breakdown-bar',
+      role: 'img',
+      'aria-label': `Run breakdown: ${tiers
+        .filter((t) => (summary.counts[t.key] ?? 0) > 0)
+        .map((t) => `${summary.counts[t.key]} ${t.label}`)
+        .join(', ')} of ${total} permutations`,
+    }, segments),
+    el('div', { class: 'run-row-chips' }, [
+      el('span', { class: 'muted run-row-total' }, `${total}`),
+      ...chips,
+    ]),
   ]);
 }
 

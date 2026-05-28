@@ -236,6 +236,15 @@ interface RunOneDepthInputs {
    * Default for the campaign command, off for `vouch run`.
    */
   includeEmptyBaseline: boolean;
+  /**
+   * When true, skip planner permutation generation entirely. Only the
+   * SUT-published happy-path perms execute. Used by phase 11a of the
+   * conveyor pipeline ("happy paths green before exploring edge cases").
+   * If the SUT publishes no happy-paths manifest, this is equivalent to
+   * a no-op run with zero perms — the campaign will exit clean immediately,
+   * which is the correct behavior (nothing to test, nothing failed).
+   */
+  happyPathsOnly: boolean;
 }
 
 /**
@@ -356,12 +365,14 @@ async function runOneDepth(input: RunOneDepthInputs): Promise<string> {
   const retestSequenceKeys = new Set(retestBlocks.map((b) => sequenceKey(b.prefix)));
   const filterBlocks = activeBlocks.filter((b) => !retestSequenceKeys.has(sequenceKey(b.prefix)));
 
-  const planResult = generatePermutationsWithStats(runId, actions, {
-    depth,
-    maxSequences: maxSeq,
-    blockedPrefixes: filterBlocks.map((b) => b.prefix),
-    includeEmptyBaseline: input.includeEmptyBaseline,
-  });
+  const planResult = input.happyPathsOnly
+    ? { permutations: [], blocked_skip_count: 0 }
+    : generatePermutationsWithStats(runId, actions, {
+        depth,
+        maxSequences: maxSeq,
+        blockedPrefixes: filterBlocks.map((b) => b.prefix),
+        includeEmptyBaseline: input.includeEmptyBaseline,
+      });
   // Merge: the planner's depth-N perms are the exploratory coverage. The
   // happy-path perms are the SUT-asserted domain truth — short-circuiting
   // the random-permutation discovery problem (Carvana's WZY1433 valid VIN
@@ -954,6 +965,7 @@ program
         // Likewise, don't pay for the empty-baseline screenshot here.
         // Campaign opts in; single-run keeps the depth-N-only contract.
         includeEmptyBaseline: false,
+        happyPathsOnly: false,
       });
       process.stdout.write(
         `[vouch/run ${runId}] view at:  vouch serve  → http://localhost:7321/#/run/${runId}\n`,
@@ -981,6 +993,10 @@ program
     "--verify-source <source>",
     "Expectation-verifier source (defaults to --oracle if not set)",
   )
+  .option(
+    "--happy-paths-only",
+    "Skip planner permutation generation; execute only the SUT-published happy paths. Used by the conveyor's phase 11a (happy paths must be green before exploring depth-N edge cases).",
+  )
   .option("--no-pause", "Run all depths back-to-back without prompting for input.")
   .option("--no-verify", "Skip the expectation-diff pass (saves LLM calls but no bug detection).")
   .option("--no-screenshots", "Skip per-step PNG capture.")
@@ -995,6 +1011,7 @@ program
       pause: boolean;
       verify: boolean;
       screenshots: boolean;
+      happyPathsOnly?: boolean;
     }) => {
       const maxDepth = parseInt(opts.maxDepth, 10);
       if (!Number.isFinite(maxDepth) || maxDepth < 1 || maxDepth > 8) {
@@ -1091,6 +1108,7 @@ program
               // copy) live on the landing page and are otherwise invisible
               // to every other phase.
               includeEmptyBaseline: true,
+              happyPathsOnly: !!opts.happyPathsOnly,
             });
 
             const report = analyzeRun(db, runId);
